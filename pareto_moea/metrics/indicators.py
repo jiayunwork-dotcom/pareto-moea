@@ -128,16 +128,18 @@ def hypervolume(approx_front: np.ndarray, reference_point: np.ndarray) -> float:
 
 
 def _hv_2d(front: np.ndarray, ref_point: np.ndarray) -> float:
-    """2维目标空间的超体积计算"""
+    """2维目标空间的超体积计算（最小化问题）"""
     sorted_front = front[np.argsort(front[:, 0])]
     hv = 0.0
-    prev_y = ref_point[1]
+    n = len(sorted_front)
 
-    for i in range(len(sorted_front) - 1, -1, -1):
-        width = ref_point[0] - sorted_front[i, 0]
-        height = prev_y - sorted_front[i, 1]
+    for i in range(n):
+        if i < n - 1:
+            width = sorted_front[i + 1, 0] - sorted_front[i, 0]
+        else:
+            width = ref_point[0] - sorted_front[i, 0]
+        height = ref_point[1] - sorted_front[i, 1]
         hv += width * height
-        prev_y = sorted_front[i, 1]
 
     return float(hv)
 

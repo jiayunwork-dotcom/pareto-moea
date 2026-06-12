@@ -395,7 +395,10 @@ def run_optimization(problem, algorithm, n_runs, progress_bar, status_text):
             else:
                 metrics['Spacing'] = spacing(approx_front)
 
-            ref_point = np.max(approx_front, axis=0) * 1.1
+            if true_front is not None and len(true_front) > 0:
+                ref_point = np.maximum(np.max(approx_front, axis=0), np.max(true_front, axis=0)) * 1.1 + 1e-6
+            else:
+                ref_point = np.max(approx_front, axis=0) * 1.1 + 1e-6
             metrics['HV'] = hv(approx_front, ref_point)
 
             result.metrics = metrics
@@ -409,13 +412,16 @@ def run_optimization(problem, algorithm, n_runs, progress_bar, status_text):
                 result=result
             )
             st.session_state.experiment_history.add_record(record)
+            st.session_state.experiment_history = st.session_state.experiment_history
 
         except Exception as e:
             st.error(f"运行错误: {e}")
             continue
 
     st.session_state.running = False
-    st.session_state.current_results[algo_name] = results
+    new_results = dict(st.session_state.current_results)
+    new_results[algo_name] = results
+    st.session_state.current_results = new_results
 
     progress_bar.progress(1.0)
     status_text.success(f"完成！共运行 {len(results)} 次")
@@ -624,7 +630,10 @@ def comparison_tab():
                         from pareto_moea.utils.pareto_utils import pareto_front
                         approx_pf = pareto_front(gen_obj)
                         if selected_metric == 'HV':
-                            ref_point = np.max(approx_pf, axis=0) * 1.1
+                            if true_front is not None and len(true_front) > 0:
+                                ref_point = np.maximum(np.max(approx_pf, axis=0), np.max(true_front, axis=0)) * 1.1 + 1e-6
+                            else:
+                                ref_point = np.max(approx_pf, axis=0) * 1.1 + 1e-6
                             val = hv(approx_pf, ref_point)
                         elif true_front is not None and selected_metric in ['GD', 'IGD']:
                             if selected_metric == 'GD':
