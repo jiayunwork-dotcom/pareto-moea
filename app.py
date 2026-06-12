@@ -289,16 +289,12 @@ def problem_info_tab(problem):
             if problem.n_obj == 2:
                 fig = plot_pareto_front_2d(
                     {'真实前沿': true_front},
-                    true_front=true_front,
-                    show_true=False,
                     title=f"{problem.name} - 真实帕累托前沿"
                 )
                 st.pyplot(fig)
             elif problem.n_obj == 3:
                 fig = plot_pareto_front_3d(
                     {'真实前沿': true_front},
-                    true_front=true_front,
-                    show_true=False,
                     title=f"{problem.name} - 真实帕累托前沿"
                 )
                 st.pyplot(fig)
