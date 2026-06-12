@@ -1,6 +1,7 @@
 """DTLZ系列测试函数"""
 
 import numpy as np
+from typing import Optional
 from .base import Problem
 
 

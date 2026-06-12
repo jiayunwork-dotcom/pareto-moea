@@ -291,19 +291,19 @@ def problem_info_tab(problem):
                     {'真实前沿': true_front},
                     title=f"{problem.name} - 真实帕累托前沿"
                 )
-                st.pyplot(fig)
+                st.pyplot(fig, use_container_width=True)
             elif problem.n_obj == 3:
                 fig = plot_pareto_front_3d(
                     {'真实前沿': true_front},
                     title=f"{problem.name} - 真实帕累托前沿"
                 )
-                st.pyplot(fig)
+                st.pyplot(fig, use_container_width=True)
             else:
                 fig = plot_parallel_coordinates(
                     {'真实前沿': true_front},
                     title=f"{problem.name} - 真实帕累托前沿"
                 )
-                st.pyplot(fig)
+                st.pyplot(fig, use_container_width=True)
         else:
             st.info("该问题的真实帕累托前沿未知")
 
@@ -455,20 +455,20 @@ def display_results(problem):
             true_front=true_front,
             title="帕累托前沿对比"
         )
-        st.pyplot(fig)
+        st.pyplot(fig, use_container_width=True)
     elif problem.n_obj == 3:
         fig = plot_pareto_front_3d(
             data_dict,
             true_front=true_front,
             title="帕累托前沿对比"
         )
-        st.pyplot(fig)
+        st.pyplot(fig, use_container_width=True)
     else:
         fig = plot_parallel_coordinates(
             data_dict,
             title="平行坐标图"
         )
-        st.pyplot(fig)
+        st.pyplot(fig, use_container_width=True)
 
     display_metrics_table(selected_algos)
     display_generation_animation(problem, selected_algos)
@@ -532,7 +532,7 @@ def display_generation_animation(problem, selected_algos):
         true_front=true_front,
         title=f"第 {gen} 代 - {algo}"
     )
-    st.pyplot(fig)
+    st.pyplot(fig, use_container_width=True)
 
 
 def comparison_tab():
@@ -589,7 +589,7 @@ def comparison_tab():
 
         if data:
             fig = plot_boxplot(data, title=f"{selected_metric} 对比")
-            st.pyplot(fig)
+            st.pyplot(fig, use_container_width=True)
 
     with col2:
         st.subheader("🔬 Wilcoxon秩和检验")
@@ -641,7 +641,7 @@ def comparison_tab():
 
         if conv_data:
             fig = plot_convergence(conv_data, title=f"{selected_metric} 收敛曲线")
-            st.pyplot(fig)
+            st.pyplot(fig, use_container_width=True)
 
 
 def decision_support_tab():
@@ -710,7 +710,7 @@ def decision_support_tab():
                 ax.set_title('帕累托前沿 - 膝点检测')
                 ax.legend()
                 ax.grid(True, alpha=0.3)
-                st.pyplot(fig)
+                st.pyplot(fig, use_container_width=True)
 
         except Exception as e:
             st.error(f"膝点检测失败: {e}")
@@ -761,7 +761,7 @@ def decision_support_tab():
                 plt.colorbar(scatter, label='贴近度')
                 ax.legend()
                 ax.grid(True, alpha=0.3)
-                st.pyplot(fig)
+                st.pyplot(fig, use_container_width=True)
 
     with tab3:
         st.subheader("🎯 区域筛选")
@@ -807,7 +807,7 @@ def decision_support_tab():
                     ax.set_title('区域筛选结果')
                     ax.legend()
                     ax.grid(True, alpha=0.3)
-                    st.pyplot(fig)
+                    st.pyplot(fig, use_container_width=True)
 
                 st.subheader("筛选出的解")
                 df = pd.DataFrame({

@@ -198,17 +198,19 @@ class Algorithm(ABC):
 
     def get_params(self) -> Dict[str, Any]:
         """获取算法参数"""
-        return {
-            'pop_size': self.pop_size,
-            'n_gen': self.n_gen,
-            'crossover_prob': self.crossover_prob,
-            'crossover_eta': self.crossover_eta,
-            'mutation_prob': self.mutation_prob,
-            'mutation_eta': self.mutation_eta,
-            'constraint_strategy': self.constraint_strategy,
-            'penalty_factor': self.penalty_factor,
-            'seed': self.seed
-        }
+        import inspect
+        params = {}
+        for cls in type(self).__mro__:
+            if cls is object:
+                break
+            if '__init__' in cls.__dict__:
+                sig = inspect.signature(cls.__init__)
+                for param_name in sig.parameters:
+                    if param_name == 'self' or param_name == 'kwargs':
+                        continue
+                    if param_name in self.__dict__:
+                        params[param_name] = self.__dict__[param_name]
+        return params
 
     def _evaluate_fitness(self, objectives: np.ndarray,
                           cv: np.ndarray) -> np.ndarray:
