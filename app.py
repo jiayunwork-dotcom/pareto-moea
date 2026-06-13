@@ -963,35 +963,44 @@ def sensitivity_analysis_tab():
         )
         selected_meta = param_meta_map[sa_param_key]
 
+        is_float_param = (selected_meta['type'] == 'float')
+        _cast = float if is_float_param else int
+        _min = _cast(selected_meta['min'])
+        _max = _cast(selected_meta['max'])
+        _step = _cast(selected_meta['step'])
+        _default_end = _cast(min(selected_meta['max'], selected_meta['default'] * 3)) if is_float_param else int(min(selected_meta['max'], int(selected_meta['default'] * 3)))
+        _step_min = _cast(selected_meta['step']) if is_float_param else 1
+
         col_start, col_end, col_step = st.columns(3)
         with col_start:
             sa_start = st.number_input(
                 "起始值",
-                value=float(selected_meta['min']) if selected_meta['type'] == 'float' else int(selected_meta['min']),
-                min_value=float(selected_meta['min']),
-                max_value=float(selected_meta['max']),
-                step=float(selected_meta['step']) if selected_meta['type'] == 'float' else int(selected_meta['step']),
+                value=_min,
+                min_value=_min,
+                max_value=_max,
+                step=_step,
                 key="sa_start",
-                format="%.4f" if selected_meta['type'] == 'float' else "%d"
+                format="%.4f" if is_float_param else "%d"
             )
         with col_end:
             sa_end = st.number_input(
                 "终止值",
-                value=float(selected_meta['max']) if selected_meta['type'] == 'float' else int(min(selected_meta['max'], selected_meta['default'] * 3)),
-                min_value=float(selected_meta['min']),
-                max_value=float(selected_meta['max']),
-                step=float(selected_meta['step']) if selected_meta['type'] == 'float' else int(selected_meta['step']),
+                value=_default_end,
+                min_value=_min,
+                max_value=_max,
+                step=_step,
                 key="sa_end",
-                format="%.4f" if selected_meta['type'] == 'float' else "%d"
+                format="%.4f" if is_float_param else "%d"
             )
         with col_step:
             sa_step = st.number_input(
                 "步长",
-                value=float(selected_meta['step']),
-                min_value=float(selected_meta['step'] if selected_meta['type'] == 'float' else 1),
-                step=float(selected_meta['step'] if selected_meta['type'] == 'float' else 1),
+                value=_step,
+                min_value=_step_min,
+                max_value=_max,
+                step=_step,
                 key="sa_step",
-                format="%.4f" if selected_meta['type'] == 'float' else "%d"
+                format="%.4f" if is_float_param else "%d"
             )
 
         param_values = _build_param_values(selected_meta, sa_start, sa_end, sa_step)
