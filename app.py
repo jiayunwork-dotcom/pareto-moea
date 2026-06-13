@@ -306,10 +306,10 @@ def problem_info_tab(problem):
             '上界': problem.xu
         })
         if problem.n_var > 10:
-            st.dataframe(bounds_df.head(10), use_container_width=True)
+            st.dataframe(bounds_df.head(10), use_container_width=True, key="df_problem_bounds_head")
             st.caption(f"... 共 {problem.n_var} 个变量")
         else:
-            st.dataframe(bounds_df, use_container_width=True)
+            st.dataframe(bounds_df, use_container_width=True, key="df_problem_bounds")
 
     with col2:
         st.subheader("真实帕累托前沿")
@@ -362,11 +362,11 @@ def run_optimization_tab():
 
     with col2:
         st.markdown("### ")
-        start_button = st.button("🚀 开始优化", type="primary", use_container_width=True, disabled=st.session_state.running)
+        start_button = st.button("🚀 开始优化", type="primary", use_container_width=True, disabled=st.session_state.running, key="btn_start_optimize")
 
     with col3:
         st.markdown("### ")
-        stop_button = st.button("⏹️ 终止", use_container_width=True, disabled=not st.session_state.running)
+        stop_button = st.button("⏹️ 终止", use_container_width=True, disabled=not st.session_state.running, key="btn_stop_optimize")
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -542,7 +542,7 @@ def display_metrics_table(selected_algos):
 
     if metrics_data:
         df = pd.DataFrame(metrics_data)
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, key="df_optimize_metrics")
 
 
 def display_generation_animation(problem, selected_algos):
@@ -635,13 +635,13 @@ def comparison_tab():
             p_matrix, labels = pairwise_wilcoxon(data)
 
             p_df = pd.DataFrame(p_matrix, index=labels, columns=labels)
-            st.dataframe(p_df.style.format('{:.4f}'), use_container_width=True)
+            st.dataframe(p_df.style.format('{:.4f}'), use_container_width=True, key="df_wilcoxon_p")
 
             st.caption("显著性水平: *** p<0.001, ** p<0.01, * p<0.05, ns 不显著")
 
             sig_matrix = [[significance_level(p) for p in row] for row in p_matrix]
             sig_df = pd.DataFrame(sig_matrix, index=labels, columns=labels)
-            st.dataframe(sig_df, use_container_width=True)
+            st.dataframe(sig_df, use_container_width=True, key="df_wilcoxon_sig")
 
     st.subheader("📈 收敛曲线")
     if len(selected_algos) >= 1:
@@ -787,7 +787,7 @@ def decision_support_tab():
             for i in range(n_obj):
                 result_df[f'f{i+1}'] = pareto_front[top_indices, i]
 
-            st.dataframe(result_df, use_container_width=True)
+            st.dataframe(result_df, use_container_width=True, key="df_topsis_result")
 
             if n_obj == 2:
                 import matplotlib.pyplot as plt
@@ -856,7 +856,7 @@ def decision_support_tab():
                 })
                 for i in range(min(5, filtered_x.shape[1])):
                     df[f'x{i+1}'] = filtered_x[:, i]
-                st.dataframe(df, use_container_width=True)
+                st.dataframe(df, use_container_width=True, key="df_region_filter")
 
         except Exception as e:
             st.error(f"筛选失败: {e}")
@@ -1055,13 +1055,15 @@ def sensitivity_analysis_tab():
                 "🚀 开始分析",
                 type="primary",
                 use_container_width=True,
-                disabled=st.session_state.sensitivity_running
+                disabled=st.session_state.sensitivity_running,
+                key="btn_start_sensitivity"
             )
         with col_stop:
             stop_analysis = st.button(
                 "⏹️ 终止",
                 use_container_width=True,
-                disabled=not st.session_state.sensitivity_running
+                disabled=not st.session_state.sensitivity_running,
+                key="btn_stop_sensitivity"
             )
 
     with right_col:
@@ -1326,7 +1328,8 @@ def sensitivity_analysis_tab():
             st.dataframe(
                 display_df.style.format(format_dict),
                 use_container_width=True,
-                hide_index=True
+                hide_index=True,
+                key="df_sensitivity_summary"
             )
 
             st.divider()
@@ -1339,7 +1342,8 @@ def sensitivity_analysis_tab():
                     csv_data,
                     fname,
                     "text/csv",
-                    use_container_width=True
+                    use_container_width=True,
+                    key="btn_sensitivity_download"
                 )
             with col_dl2:
                 st.caption("CSV 文件包含各参数值下 IGD/GD/HV 的均值、标准差、最小值和最大值")
@@ -1380,22 +1384,23 @@ def history_tab():
     if filter_metric != 'timestamp':
         filtered = filtered.sort_values(filter_metric)
 
-    st.dataframe(filtered, use_container_width=True, hide_index=True)
+    st.dataframe(filtered, use_container_width=True, hide_index=True, key="df_history_records")
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("📥 导出为 CSV", use_container_width=True):
+        if st.button("📥 导出为 CSV", use_container_width=True, key="btn_history_export"):
             csv = filtered.to_csv(index=False)
             st.download_button(
                 "下载 CSV 文件",
                 csv,
                 f"experiments_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 "text/csv",
-                use_container_width=True
+                use_container_width=True,
+                key="btn_history_download"
             )
 
     with col2:
-        if st.button("🗑️ 清空所有记录", use_container_width=True, type="secondary"):
+        if st.button("🗑️ 清空所有记录", use_container_width=True, type="secondary", key="btn_history_clear"):
             history.clear()
             st.rerun()
 
@@ -1403,7 +1408,7 @@ def history_tab():
     metric_cols = [c for c in df.columns if c.startswith('metric_')]
     if metric_cols:
         summary = history.summary()
-        st.dataframe(summary, use_container_width=True)
+        st.dataframe(summary, use_container_width=True, key="df_history_summary")
 
 
 def main():
