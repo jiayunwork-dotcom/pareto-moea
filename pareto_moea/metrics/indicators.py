@@ -253,7 +253,7 @@ def spacing(approx_front: np.ndarray) -> float:
         approx_front: 近似帕累托前沿，形状为 (n_approx, n_obj)
 
     Returns:
-        Spacing 值
+        Spacing 值（归一化版本，即变异系数）
     """
     approx_front = np.asarray(approx_front, dtype=float)
 
@@ -280,6 +280,42 @@ def spacing(approx_front: np.ndarray) -> float:
         return 0.0
 
     spacing_val = np.sqrt(np.sum((min_distances - mean_dist) ** 2) / (n_approx - 1)) / mean_dist
+    return float(spacing_val)
+
+
+def spacing_std(approx_front: np.ndarray) -> float:
+    """计算间距指标的标准差版本 (Spacing Std)
+
+    对种群中每个个体计算其到最近邻的欧氏距离，然后取这些距离的标准差。
+    值越小说明分布越均匀。
+
+    Args:
+        approx_front: 近似帕累托前沿，形状为 (n_approx, n_obj)
+
+    Returns:
+        Spacing 标准差 值
+    """
+    approx_front = np.asarray(approx_front, dtype=float)
+
+    if approx_front.ndim == 1:
+        approx_front = approx_front.reshape(1, -1)
+
+    n_approx = len(approx_front)
+
+    if n_approx <= 1:
+        return 0.0
+
+    # 计算每个点到其他点的最小距离
+    min_distances = np.zeros(n_approx)
+
+    for i in range(n_approx):
+        diff = approx_front - approx_front[i]
+        dists = np.linalg.norm(diff, axis=1)
+        dists[i] = np.inf
+        min_distances[i] = np.min(dists)
+
+    # 直接计算标准差（不归一化）
+    spacing_val = np.std(min_distances, ddof=1)
     return float(spacing_val)
 
 

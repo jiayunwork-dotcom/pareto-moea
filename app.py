@@ -19,7 +19,7 @@ from pareto_moea.algorithms import (
 )
 
 from pareto_moea.metrics import (
-    gd, igd, hv, spacing, spread,
+    gd, igd, hv, spacing, spacing_std, spread,
     pairwise_wilcoxon, significance_level, compute_statistics
 )
 
@@ -30,7 +30,9 @@ from pareto_moea.visualization import (
     plot_convergence,
     plot_boxplot,
     plot_generation_animation,
-    plot_sensitivity_line
+    plot_sensitivity_line,
+    plot_convergence_metrics,
+    plot_population_scatter
 )
 
 from pareto_moea.decision_making import (
@@ -126,6 +128,15 @@ def init_session_state():
 
     if 'sensitivity_running' not in st.session_state:
         st.session_state.sensitivity_running = False
+
+    if 'monitor_running' not in st.session_state:
+        st.session_state.monitor_running = False
+
+    if 'monitor_data' not in st.session_state:
+        st.session_state.monitor_data = None
+
+    if 'monitor_selected_gen' not in st.session_state:
+        st.session_state.monitor_selected_gen = 0
 
 
 def sidebar_problem_config():
@@ -1349,6 +1360,397 @@ def sensitivity_analysis_tab():
                 st.caption("CSV 文件包含各参数值下 IGD/GD/HV 的均值、标准差、最小值和最大值")
 
 
+def _create_monitor_algorithm(algo_name, algo_class, pop_size, n_gen, seed):
+    """创建监控用的算法实例"""
+    extra = {}
+    if algo_name == 'NSGA-III':
+        extra['n_divisions'] = 12
+    elif algo_name == 'MOEA/D':
+        extra['n_weights'] = pop_size
+        extra['neighbor_size'] = 20
+    elif algo_name == 'SPEA2':
+        extra['archive_size'] = pop_size
+    elif algo_name == 'SMS-EMOA':
+        extra['n_offspring'] = 1
+
+    return algo_class(
+        pop_size=pop_size,
+        n_gen=n_gen,
+        crossover_prob=0.9,
+        crossover_eta=20.0,
+        mutation_prob=0.1,
+        mutation_eta=20.0,
+        constraint_strategy='feasibility_rule',
+        seed=seed,
+        **extra
+    )
+
+
+def _compute_monitor_metrics(objectives, true_front, ref_point):
+    """计算监控用的收敛指标"""
+    from pareto_moea.utils.pareto_utils import pareto_front
+
+    feasible_obj = objectives
+    approx_pf = pareto_front(feasible_obj)
+
+    metrics = {}
+
+    if true_front is not None and len(true_front) > 0:
+        metrics['IGD'] = igd(approx_pf, true_front)
+    else:
+        metrics['IGD'] = np.nan
+
+    metrics['HV'] = hv(approx_pf, ref_point)
+    metrics['Spacing'] = spacing_std(approx_pf)
+
+    return metrics
+
+
+def convergence_monitoring_tab():
+    """算法收敛性动态监控标签页"""
+    st.header("📈 算法收敛性动态监控")
+    st.caption("实时监控优化过程中IGD、HV、Spacing等收敛指标的变化趋势")
+
+    left_col, right_col = st.columns([1, 2], gap="large")
+
+    with left_col:
+        st.subheader("⚙️ 运行配置")
+
+        mon_algo_name = st.selectbox(
+            "选择算法",
+            list(ALGORITHM_MAP.keys()),
+            key="mon_algo",
+            index=0
+        )
+        algo_class = ALGORITHM_MAP[mon_algo_name]
+
+        st.divider()
+        st.markdown("**问题配置**")
+
+        mon_series = st.selectbox("测试函数系列", list(PROBLEM_MAP.keys()), key="mon_series")
+        mon_prob_name = st.selectbox("测试函数", list(PROBLEM_MAP[mon_series].keys()), key="mon_prob")
+        problem_class = PROBLEM_MAP[mon_series][mon_prob_name]
+
+        if mon_series == 'DTLZ系列':
+            mon_n_obj = st.slider("目标数量", 2, 10, 3, key="mon_dtlz_n_obj")
+            mon_k = st.slider("距离参数k", 1, 20, 5, key="mon_dtlz_k")
+            mon_problem = problem_class(n_obj=mon_n_obj, k=mon_k)
+        elif mon_series == 'WFG系列':
+            mon_n_obj = st.slider("目标数量", 2, 10, 3, key="mon_wfg_n_obj")
+            mon_k = st.slider("位置参数k", 2, 20, 4, step=2, key="mon_wfg_k")
+            mon_problem = problem_class(n_obj=mon_n_obj, k=mon_k)
+        else:
+            mon_n_var = st.slider("变量数量", 2, 100, 30, key="mon_zdt_n_var")
+            mon_problem = problem_class(n_var=mon_n_var)
+
+        st.divider()
+        st.markdown("**监控参数**")
+
+        mon_n_gen = st.slider("最大代数", 10, 1000, 100, step=10, key="mon_n_gen")
+        max_allowed_interval = mon_n_gen // 2
+
+        mon_sample_interval = st.number_input(
+            "采样间隔（代）",
+            min_value=1,
+            max_value=max_allowed_interval,
+            value=min(5, max_allowed_interval),
+            step=1,
+            key="mon_sample_interval"
+        )
+        mon_pop_size = st.slider("种群大小", 10, 500, 100, step=10, key="mon_pop_size")
+        mon_seed = st.number_input("随机种子", 0, None, 42, key="mon_seed")
+
+        is_positive_int = (float(mon_sample_interval) > 0 and
+                          float(mon_sample_interval) % 1 == 0)
+        interval_valid = is_positive_int and mon_sample_interval <= max_allowed_interval
+
+        if not interval_valid:
+            st.warning(
+                f"⚠️ 采样间隔必须是正整数且不超过最大代数的一半 ({max_allowed_interval})，"
+                f"当前值 {mon_sample_interval} 无效"
+            )
+
+        st.divider()
+
+        true_front = mon_problem.pareto_front(n_points=1000)
+        has_true_front = true_front is not None and len(true_front) > 0
+
+        if has_true_front:
+            st.success(f"✅ 该问题有真实帕累托前沿 ({len(true_front)} 个点)，IGD指标可用")
+        else:
+            st.info("ℹ️ 该问题真实帕累托前沿未知，IGD指标将不显示")
+
+        st.divider()
+
+        col_run, col_stop = st.columns(2)
+        with col_run:
+            start_monitor = st.button(
+                "🚀 启动监控运行",
+                type="primary",
+                use_container_width=True,
+                disabled=(st.session_state.monitor_running or not interval_valid),
+                key="btn_start_monitor"
+            )
+        with col_stop:
+            stop_monitor = st.button(
+                "⏹️ 终止",
+                use_container_width=True,
+                disabled=not st.session_state.monitor_running,
+                key="btn_stop_monitor"
+            )
+
+    with right_col:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        if start_monitor and not st.session_state.monitor_running and interval_valid:
+            st.session_state.monitor_running = True
+            st.session_state.monitor_data = None
+
+            monitor_generations = []
+            monitor_igd = []
+            monitor_hv = []
+            monitor_spacing = []
+            monitor_populations = {}
+
+            algo = _create_monitor_algorithm(
+                mon_algo_name, algo_class, mon_pop_size, mon_n_gen, mon_seed
+            )
+
+            true_front_pf = mon_problem.pareto_front() if has_true_front else None
+
+            ref_point = None
+
+            def monitor_callback(algo_ref, gen, pop, obj, cv):
+                nonlocal ref_point
+
+                if not st.session_state.monitor_running:
+                    algo_ref.stop()
+                    return
+
+                if gen == 0 or gen % mon_sample_interval == 0 or gen == mon_n_gen:
+                    if ref_point is None:
+                        if true_front_pf is not None and len(true_front_pf) > 0:
+                            ref_point = np.maximum(
+                                np.max(obj, axis=0),
+                                np.max(true_front_pf, axis=0)
+                            ) * 1.1 + 1e-6
+                        else:
+                            ref_point = np.max(obj, axis=0) * 1.1 + 1e-6
+
+                    metrics = _compute_monitor_metrics(obj, true_front_pf, ref_point)
+
+                    monitor_generations.append(gen)
+                    monitor_igd.append(metrics['IGD'])
+                    monitor_hv.append(metrics['HV'])
+                    monitor_spacing.append(metrics['Spacing'])
+                    monitor_populations[gen] = obj.copy()
+
+                    curr_progress = gen / max(1, mon_n_gen)
+                    progress_bar.progress(curr_progress)
+                    status_text.info(
+                        f"📊 监控运行中 - 第 {gen}/{mon_n_gen} 代 | "
+                        f"已采样 {len(monitor_generations)} 个点 | "
+                        f"HV: {metrics['HV']:.4f} | "
+                        f"Spacing: {metrics['Spacing']:.6f}"
+                        + (f" | IGD: {metrics['IGD']:.6f}" if has_true_front else "")
+                    )
+
+            algo.set_callback(monitor_callback)
+
+            try:
+                result = algo.run(mon_problem, verbose=False)
+
+                if len(monitor_generations) == 0 or monitor_generations[-1] != mon_n_gen:
+                    if ref_point is None:
+                        if true_front_pf is not None and len(true_front_pf) > 0:
+                            ref_point = np.maximum(
+                                np.max(result.final_objectives, axis=0),
+                                np.max(true_front_pf, axis=0)
+                            ) * 1.1 + 1e-6
+                        else:
+                            ref_point = np.max(result.final_objectives, axis=0) * 1.1 + 1e-6
+
+                    final_metrics = _compute_monitor_metrics(
+                        result.final_objectives, true_front_pf, ref_point
+                    )
+                    monitor_generations.append(mon_n_gen)
+                    monitor_igd.append(final_metrics['IGD'])
+                    monitor_hv.append(final_metrics['HV'])
+                    monitor_spacing.append(final_metrics['Spacing'])
+                    monitor_populations[mon_n_gen] = result.final_objectives.copy()
+
+                st.session_state.monitor_data = {
+                    'algorithm': mon_algo_name,
+                    'problem': mon_problem.name,
+                    'n_gen': mon_n_gen,
+                    'pop_size': mon_pop_size,
+                    'sample_interval': mon_sample_interval,
+                    'seed': mon_seed,
+                    'generations': monitor_generations,
+                    'igd': monitor_igd,
+                    'hv': monitor_hv,
+                    'spacing': monitor_spacing,
+                    'populations': monitor_populations,
+                    'true_front': true_front_pf,
+                    'has_true_front': has_true_front,
+                    'problem_obj': mon_problem,
+                    'n_obj': mon_problem.n_obj
+                }
+
+                progress_bar.progress(1.0)
+                status_text.success("✅ 监控运行完成！")
+                st.session_state.monitor_running = False
+
+                record = ExperimentRecord(
+                    algorithm_name=mon_algo_name,
+                    problem_name=mon_problem.name,
+                    params=algo.get_params(),
+                    metrics={
+                        'IGD': monitor_igd[-1] if has_true_front else np.nan,
+                        'HV': monitor_hv[-1],
+                        'Spacing': monitor_spacing[-1]
+                    },
+                    runtime=result.runtime,
+                    result=result
+                )
+                st.session_state.experiment_history.add_record(record)
+                st.rerun()
+
+            except Exception as e:
+                st.session_state.monitor_running = False
+                progress_bar.progress(0)
+                status_text.error(f"❌ 运行出错: {e}")
+                import traceback
+                st.error(traceback.format_exc())
+
+        if stop_monitor and st.session_state.monitor_running:
+            st.session_state.monitor_running = False
+            status_text.warning("⚠️ 监控已终止")
+
+        if not st.session_state.monitor_data:
+            if not st.session_state.monitor_running:
+                st.info("👈 请在左侧配置参数后点击\"启动监控运行\"")
+            return
+
+        mon_data = st.session_state.monitor_data
+
+        metrics_data = {}
+        if mon_data['has_true_front']:
+            metrics_data['IGD'] = mon_data['igd']
+        metrics_data['HV'] = mon_data['hv']
+        metrics_data['Spacing'] = mon_data['spacing']
+
+        colors = {
+            'IGD': '#d62728',
+            'HV': '#2ca02c',
+            'Spacing': '#ff7f0e'
+        }
+
+        st.subheader("📊 收敛指标变化曲线")
+        fig_metrics = plot_convergence_metrics(
+            mon_data['generations'],
+            metrics_data,
+            title=f"{mon_data['algorithm']} on {mon_data['problem']} - 收敛指标",
+            xlabel="代数 (Generation)",
+            figsize=(10, 6),
+            colors=colors
+        )
+        st.pyplot(fig_metrics, use_container_width=True)
+
+        st.divider()
+
+        st.subheader("🎯 目标空间种群分布")
+
+        gens = mon_data['generations']
+        if len(gens) > 0:
+            gen_labels = [f"第 {g} 代" for g in gens]
+
+            col_slider1, col_slider2 = st.columns([3, 1])
+            with col_slider1:
+                selected_idx = st.select_slider(
+                    "选择代数",
+                    options=list(range(len(gens))),
+                    value=len(gens) - 1,
+                    format_func=lambda x: gen_labels[x],
+                    key="mon_gen_slider"
+                )
+            with col_slider2:
+                st.info(f"当前: {gen_labels[selected_idx]}")
+
+            selected_gen = gens[selected_idx]
+            current_pop = mon_data['populations'][selected_gen]
+            true_front_pf = mon_data.get('true_front')
+
+            fig_scatter = plot_population_scatter(
+                current_pop,
+                true_front=true_front_pf,
+                title=f"第 {selected_gen} 代种群分布 - {mon_data['algorithm']} on {mon_data['problem']}",
+                figsize=(9, 7),
+                point_color='#1f77b4',
+                true_front_color='#d62728'
+            )
+            st.pyplot(fig_scatter, use_container_width=True)
+
+            pop_metrics = {
+                '代数': selected_gen,
+                '种群大小': len(current_pop)
+            }
+            if mon_data['has_true_front']:
+                pop_metrics['IGD'] = f"{mon_data['igd'][selected_idx]:.6f}"
+            pop_metrics['HV'] = f"{mon_data['hv'][selected_idx]:.6f}"
+            pop_metrics['Spacing'] = f"{mon_data['spacing'][selected_idx]:.6f}"
+
+            st.caption("当前代数指标: " + " | ".join([f"{k}: {v}" for k, v in pop_metrics.items()]))
+
+        st.divider()
+
+        st.subheader("📋 收敛数据表格")
+        df_data = {
+            '代数': mon_data['generations'],
+            'HV': mon_data['hv'],
+            'Spacing': mon_data['spacing']
+        }
+        if mon_data['has_true_front']:
+            df_data['IGD'] = mon_data['igd']
+
+        df_monitor = pd.DataFrame(df_data)
+
+        if mon_data['has_true_front']:
+            display_cols = ['代数', 'IGD', 'HV', 'Spacing']
+        else:
+            display_cols = ['代数', 'HV', 'Spacing']
+
+        format_dict = {}
+        for col in display_cols:
+            if col != '代数':
+                format_dict[col] = '{:.6f}'
+
+        st.dataframe(
+            df_monitor[display_cols].style.format(format_dict),
+            use_container_width=True,
+            hide_index=True,
+            key="df_monitor_data"
+        )
+
+        st.divider()
+
+        col_dl1, col_dl2 = st.columns([1, 3])
+        with col_dl1:
+            csv_data = df_monitor[display_cols].to_csv(index=False, encoding='utf-8-sig')
+            fname = f"convergence_{mon_data['algorithm']}_{mon_data['problem']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            st.download_button(
+                "📥 导出为 CSV",
+                csv_data,
+                fname,
+                "text/csv",
+                use_container_width=True,
+                key="btn_monitor_download"
+            )
+        with col_dl2:
+            st.caption("CSV 文件包含各采样代数的 IGD（如有）、HV、Spacing 指标值")
+
+
 def history_tab():
     """实验记录标签页"""
     st.header("📋 实验记录")
@@ -1421,13 +1823,14 @@ def main():
     problem = sidebar_problem_config()
     sidebar_algorithm_config()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📚 问题定义",
         "▶️ 运行优化",
         "📊 结果可视化",
         "🔬 对比分析",
         "🎯 决策支持",
         "📐 参数灵敏度分析",
+        "📈 算法收敛性监控",
         "📋 实验记录"
     ])
 
@@ -1454,6 +1857,9 @@ def main():
         sensitivity_analysis_tab()
 
     with tab7:
+        convergence_monitoring_tab()
+
+    with tab8:
         history_tab()
 
     st.divider()

@@ -8,6 +8,8 @@ from .plots import (
     plot_boxplot,
     plot_generation_animation,
     plot_sensitivity_line,
+    plot_convergence_metrics,
+    plot_population_scatter,
 )
 
 __all__ = [
@@ -18,4 +20,6 @@ __all__ = [
     "plot_boxplot",
     "plot_generation_animation",
     "plot_sensitivity_line",
+    "plot_convergence_metrics",
+    "plot_population_scatter",
 ]

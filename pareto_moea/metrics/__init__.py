@@ -5,6 +5,7 @@ from .indicators import (
     inverted_generational_distance,
     hypervolume,
     spacing,
+    spacing_std,
     spread
 )
 
@@ -19,12 +20,14 @@ gd = generational_distance
 igd = inverted_generational_distance
 hv = hypervolume
 sp = spacing
+spacing_sd = spacing_std
 
 __all__ = [
     'generational_distance', 'gd',
     'inverted_generational_distance', 'igd',
     'hypervolume', 'hv',
     'spacing', 'sp',
+    'spacing_std', 'spacing_sd',
     'spread',
     'wilcoxon_test',
     'pairwise_wilcoxon',

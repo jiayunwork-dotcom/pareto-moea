@@ -1011,3 +1011,237 @@ def plot_sensitivity_line(
 
     fig.tight_layout()
     return fig
+
+
+def plot_convergence_metrics(
+    generations: Union[List[int], np.ndarray],
+    metrics_data: Dict[str, Union[List[float], np.ndarray]],
+    title: str = "Convergence Metrics",
+    xlabel: str = "Generation",
+    figsize: Tuple[float, float] = (10, 7),
+    colors: Optional[Dict[str, str]] = None,
+    show_grid: bool = True,
+    show_legend: bool = True,
+) -> Figure:
+    """绘制多条收敛指标曲线（共享x轴，y轴各自独立）
+
+    使用 parasite 轴实现三条曲线共享x轴但y轴范围独立的效果。
+
+    Args:
+        generations: 代数列表，形状 (n_points,)
+        metrics_data: 指标数据字典，键为指标名称，值为对应代数的指标值列表
+        title: 图表标题
+        xlabel: x轴标签
+        figsize: 图表尺寸
+        colors: 颜色字典，键为指标名称，值为颜色
+        show_grid: 是否显示网格
+        show_legend: 是否显示图例
+
+    Returns:
+        matplotlib Figure 对象
+    """
+    from mpl_toolkits.axes_grid1 import host_subplot
+
+    fig = plt.figure(figsize=figsize)
+    host = host_subplot(111, figure=fig)
+    fig.subplots_adjust(right=0.75)
+
+    generations = np.asarray(generations, dtype=int)
+    metric_names = list(metrics_data.keys())
+    n_metrics = len(metric_names)
+
+    default_colors_list = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    if colors is None:
+        colors = {}
+        for i, name in enumerate(metric_names):
+            colors[name] = default_colors_list[i % len(default_colors_list)]
+
+    axes = [host]
+    for i in range(n_metrics - 1):
+        par = host.twinx()
+        if i > 0:
+            par.spines["right"].set_position(("axes", 1 + 0.15 * i))
+        axes.append(par)
+
+    lines = []
+    labels = []
+
+    for i, metric_name in enumerate(metric_names):
+        values = np.asarray(metrics_data[metric_name], dtype=float)
+        color = colors.get(metric_name, default_colors_list[i % len(default_colors_list)])
+        ax = axes[i]
+
+        line, = ax.plot(
+            generations,
+            values,
+            color=color,
+            linewidth=2,
+            marker='o',
+            markersize=4,
+            label=metric_name
+        )
+        lines.append(line)
+        labels.append(metric_name)
+
+        ax.set_ylabel(metric_name, fontsize=11, color=color)
+        ax.tick_params(axis='y', labelcolor=color, labelsize=10)
+
+        valid_mask = ~np.isnan(values)
+        if np.any(valid_mask):
+            y_min = np.nanmin(values) * 0.95
+            y_max = np.nanmax(values) * 1.05
+            if y_min == y_max:
+                y_min = y_min * 0.9
+                y_max = y_max * 1.1
+            ax.set_ylim(y_min, y_max)
+
+    host.set_xlabel(xlabel, fontsize=12)
+    host.set_title(title, fontsize=14)
+
+    if show_grid:
+        host.grid(True, alpha=0.3)
+
+    if show_legend:
+        host.legend(lines, labels, loc="upper center", bbox_to_anchor=(0.5, -0.12),
+                   ncol=n_metrics, fontsize=10)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_population_scatter(
+    objectives: np.ndarray,
+    true_front: Optional[np.ndarray] = None,
+    title: str = "Population Distribution",
+    figsize: Tuple[float, float] = (8, 6),
+    point_color: str = "#1f77b4",
+    true_front_color: str = "#d62728",
+    show_grid: bool = True,
+) -> Figure:
+    """绘制种群在目标空间的散点图
+
+    Args:
+        objectives: 种群目标值，形状 (n_pop, n_obj)
+        true_front: 真实帕累托前沿，可选
+        title: 图表标题
+        figsize: 图表尺寸
+        point_color: 种群点颜色
+        true_front_color: 真实前沿颜色
+        show_grid: 是否显示网格
+
+    Returns:
+        matplotlib Figure 对象
+    """
+    objectives = np.asarray(objectives, dtype=float)
+    if objectives.ndim == 1:
+        objectives = objectives.reshape(1, -1)
+
+    n_obj = objectives.shape[1]
+
+    if n_obj == 2:
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.scatter(
+            objectives[:, 0],
+            objectives[:, 1],
+            c=point_color,
+            alpha=0.7,
+            s=40,
+            label='Population'
+        )
+        ax.set_xlabel('Objective 1', fontsize=12)
+        ax.set_ylabel('Objective 2', fontsize=12)
+
+        if true_front is not None:
+            true_front = np.asarray(true_front, dtype=float)
+            if true_front.ndim == 1:
+                true_front = true_front.reshape(1, -1)
+            sorted_idx = np.argsort(true_front[:, 0])
+            sorted_front = true_front[sorted_idx]
+            ax.plot(
+                sorted_front[:, 0],
+                sorted_front[:, 1],
+                c=true_front_color,
+                linestyle='--',
+                linewidth=2,
+                label='True Pareto Front'
+            )
+
+    elif n_obj == 3:
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111, projection='3d')
+        ax.scatter(
+            objectives[:, 0],
+            objectives[:, 1],
+            objectives[:, 2],
+            c=point_color,
+            alpha=0.7,
+            s=40,
+            label='Population'
+        )
+        ax.set_xlabel('Objective 1', fontsize=12)
+        ax.set_ylabel('Objective 2', fontsize=12)
+        ax.set_zlabel('Objective 3', fontsize=12)
+
+        if true_front is not None:
+            true_front = np.asarray(true_front, dtype=float)
+            if true_front.ndim == 1:
+                true_front = true_front.reshape(1, -1)
+            ax.scatter(
+                true_front[:, 0],
+                true_front[:, 1],
+                true_front[:, 2],
+                c=true_front_color,
+                marker='.',
+                s=10,
+                alpha=0.4,
+                label='True Pareto Front'
+            )
+
+    else:
+        fig, ax = plt.subplots(figsize=figsize)
+        x_positions = np.arange(n_obj)
+        obj_labels = [f'f{i+1}' for i in range(n_obj)]
+
+        all_min = np.min(objectives, axis=0)
+        all_max = np.max(objectives, axis=0)
+        all_range = all_max - all_min
+        all_range[all_range == 0] = 1.0
+
+        normalized = (objectives - all_min) / all_range
+
+        for j in range(len(normalized)):
+            ax.plot(
+                x_positions,
+                normalized[j],
+                color=point_color,
+                alpha=0.5,
+                linewidth=1.0
+            )
+
+        if true_front is not None:
+            true_front = np.asarray(true_front, dtype=float)
+            if true_front.ndim == 1:
+                true_front = true_front.reshape(1, -1)
+            true_norm = (true_front - all_min) / all_range
+            for j in range(len(true_norm)):
+                ax.plot(
+                    x_positions,
+                    true_norm[j],
+                    color=true_front_color,
+                    alpha=0.3,
+                    linewidth=0.8,
+                    label='True Pareto Front' if j == 0 else ''
+                )
+
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(obj_labels, fontsize=10)
+        ax.set_ylabel('Normalized Value', fontsize=12)
+
+    ax.set_title(title, fontsize=14)
+
+    if show_grid:
+        ax.grid(True, alpha=0.3)
+
+    ax.legend(loc='best', fontsize=10)
+    fig.tight_layout()
+    return fig
