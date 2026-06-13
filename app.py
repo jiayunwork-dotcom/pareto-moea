@@ -29,7 +29,8 @@ from pareto_moea.visualization import (
     plot_parallel_coordinates,
     plot_convergence,
     plot_boxplot,
-    plot_generation_animation
+    plot_generation_animation,
+    plot_sensitivity_line
 )
 
 from pareto_moea.decision_making import (
@@ -71,6 +72,31 @@ ALGORITHM_MAP = {
     'SMS-EMOA': SMSEMOA
 }
 
+ALGORITHM_PARAMS = {
+    '通用参数': [
+        {'key': 'pop_size', 'label': '种群大小', 'type': 'int', 'default': 100, 'min': 10, 'max': 1000, 'step': 10},
+        {'key': 'n_gen', 'label': '最大代数', 'type': 'int', 'default': 100, 'min': 10, 'max': 5000, 'step': 10},
+        {'key': 'crossover_prob', 'label': '交叉概率', 'type': 'float', 'default': 0.9, 'min': 0.0, 'max': 1.0, 'step': 0.05},
+        {'key': 'crossover_eta', 'label': '交叉分布指数', 'type': 'float', 'default': 20.0, 'min': 1.0, 'max': 100.0, 'step': 1.0},
+        {'key': 'mutation_prob', 'label': '变异概率', 'type': 'float', 'default': 0.1, 'min': 0.0, 'max': 1.0, 'step': 0.01},
+        {'key': 'mutation_eta', 'label': '变异分布指数', 'type': 'float', 'default': 20.0, 'min': 1.0, 'max': 100.0, 'step': 1.0},
+    ],
+    'NSGA-II': [],
+    'NSGA-III': [
+        {'key': 'n_divisions', 'label': '参考点划分数', 'type': 'int', 'default': 12, 'min': 2, 'max': 100, 'step': 1},
+    ],
+    'MOEA/D': [
+        {'key': 'n_weights', 'label': '权重向量数', 'type': 'int', 'default': 100, 'min': 10, 'max': 1000, 'step': 10},
+        {'key': 'neighbor_size', 'label': '邻域大小', 'type': 'int', 'default': 20, 'min': 2, 'max': 200, 'step': 1},
+    ],
+    'SPEA2': [
+        {'key': 'archive_size', 'label': '归档集大小', 'type': 'int', 'default': 100, 'min': 10, 'max': 1000, 'step': 10},
+    ],
+    'SMS-EMOA': [
+        {'key': 'n_offspring', 'label': '每代子代数', 'type': 'int', 'default': 1, 'min': 1, 'max': 50, 'step': 1},
+    ],
+}
+
 
 def init_session_state():
     """初始化session state"""
@@ -94,6 +120,12 @@ def init_session_state():
 
     if 'batch_results' not in st.session_state:
         st.session_state.batch_results = {}
+
+    if 'sensitivity_results' not in st.session_state:
+        st.session_state.sensitivity_results = None
+
+    if 'sensitivity_running' not in st.session_state:
+        st.session_state.sensitivity_running = False
 
 
 def sidebar_problem_config():
@@ -830,6 +862,480 @@ def decision_support_tab():
             st.error(f"筛选失败: {e}")
 
 
+def _get_available_params(algo_name):
+    """获取指定算法可用的参数列表"""
+    params = list(ALGORITHM_PARAMS['通用参数'])
+    if algo_name in ALGORITHM_PARAMS:
+        params.extend(ALGORITHM_PARAMS[algo_name])
+    return params
+
+
+def _build_param_values(param_meta, start, end, step):
+    """根据范围和步长构建参数值列表"""
+    if param_meta['type'] == 'int':
+        start = int(start)
+        end = int(end)
+        step = int(step) if step > 0 else 1
+        values = list(range(start, end + 1, step))
+    else:
+        import numpy as np
+        values = []
+        v = start
+        while v <= end + 1e-9:
+            values.append(round(v, 6))
+            v += step
+    return values
+
+
+def _create_algorithm_with_param(algo_name, algo_class, base_params, param_key, param_value, run_seed=None):
+    """创建算法实例，覆盖指定参数"""
+    params = dict(base_params)
+    params[param_key] = param_value
+    if run_seed is not None:
+        params['seed'] = run_seed
+    extra_keys = set()
+    if algo_name == 'NSGA-III' and 'n_divisions' in params:
+        extra_keys.add('n_divisions')
+    if algo_name == 'MOEA/D':
+        extra_keys.update(['n_weights', 'neighbor_size'])
+    if algo_name == 'SPEA2' and 'archive_size' in params:
+        extra_keys.add('archive_size')
+    if algo_name == 'SMS-EMOA' and 'n_offspring' in params:
+        extra_keys.add('n_offspring')
+
+    extra = {k: params.pop(k) for k in list(params.keys()) if k in extra_keys}
+
+    try:
+        return algo_class(**params, **extra)
+    except Exception:
+        return algo_class(**params)
+
+
+def sensitivity_analysis_tab():
+    """算法参数灵敏度分析标签页"""
+    st.header("🔬 算法参数灵敏度分析")
+    st.caption("系统分析算法参数对性能指标的影响，帮助选择最优参数配置")
+
+    left_col, right_col = st.columns([1, 2], gap="large")
+
+    with left_col:
+        st.subheader("⚙️ 参数配置")
+
+        sa_algo_name = st.selectbox(
+            "选择算法",
+            list(ALGORITHM_MAP.keys()),
+            key="sa_algo",
+            index=0
+        )
+        algo_class = ALGORITHM_MAP[sa_algo_name]
+
+        st.divider()
+        st.markdown("**问题配置**")
+
+        sa_series = st.selectbox("测试函数系列", list(PROBLEM_MAP.keys()), key="sa_series")
+        sa_prob_name = st.selectbox("测试函数", list(PROBLEM_MAP[sa_series].keys()), key="sa_prob")
+        problem_class = PROBLEM_MAP[sa_series][sa_prob_name]
+
+        if sa_series == 'DTLZ系列':
+            sa_n_obj = st.slider("目标数量", 2, 10, 3, key="sa_dtlz_n_obj")
+            sa_k = st.slider("距离参数k", 1, 20, 5, key="sa_dtlz_k")
+            sa_problem = problem_class(n_obj=sa_n_obj, k=sa_k)
+        elif sa_series == 'WFG系列':
+            sa_n_obj = st.slider("目标数量", 2, 10, 3, key="sa_wfg_n_obj")
+            sa_k = st.slider("位置参数k", 2, 20, 4, step=2, key="sa_wfg_k")
+            sa_problem = problem_class(n_obj=sa_n_obj, k=sa_k)
+        else:
+            sa_n_var = st.slider("变量数量", 2, 100, 30, key="sa_zdt_n_var")
+            sa_problem = problem_class(n_var=sa_n_var)
+
+        st.divider()
+        st.markdown("**分析目标参数**")
+
+        available_params = _get_available_params(sa_algo_name)
+        param_labels = {p['key']: p['label'] for p in available_params}
+        param_meta_map = {p['key']: p for p in available_params}
+
+        sa_param_key = st.selectbox(
+            "选择要分析的参数",
+            options=list(param_labels.keys()),
+            format_func=lambda k: f"{param_labels[k]} ({k})",
+            key="sa_param_key"
+        )
+        selected_meta = param_meta_map[sa_param_key]
+
+        col_start, col_end, col_step = st.columns(3)
+        with col_start:
+            sa_start = st.number_input(
+                "起始值",
+                value=float(selected_meta['min']) if selected_meta['type'] == 'float' else int(selected_meta['min']),
+                min_value=float(selected_meta['min']),
+                max_value=float(selected_meta['max']),
+                step=float(selected_meta['step']) if selected_meta['type'] == 'float' else int(selected_meta['step']),
+                key="sa_start",
+                format="%.4f" if selected_meta['type'] == 'float' else "%d"
+            )
+        with col_end:
+            sa_end = st.number_input(
+                "终止值",
+                value=float(selected_meta['max']) if selected_meta['type'] == 'float' else int(min(selected_meta['max'], selected_meta['default'] * 3)),
+                min_value=float(selected_meta['min']),
+                max_value=float(selected_meta['max']),
+                step=float(selected_meta['step']) if selected_meta['type'] == 'float' else int(selected_meta['step']),
+                key="sa_end",
+                format="%.4f" if selected_meta['type'] == 'float' else "%d"
+            )
+        with col_step:
+            sa_step = st.number_input(
+                "步长",
+                value=float(selected_meta['step']),
+                min_value=float(selected_meta['step'] if selected_meta['type'] == 'float' else 1),
+                step=float(selected_meta['step'] if selected_meta['type'] == 'float' else 1),
+                key="sa_step",
+                format="%.4f" if selected_meta['type'] == 'float' else "%d"
+            )
+
+        param_values = _build_param_values(selected_meta, sa_start, sa_end, sa_step)
+        st.info(f"参数取值: {param_values} (共 {len(param_values)} 个)")
+
+        sa_n_runs = st.slider(
+            "每个参数值重复次数",
+            min_value=1, max_value=50, value=5, step=1,
+            key="sa_n_runs"
+        )
+
+        st.divider()
+        st.markdown("**基础算法参数（保持默认）**")
+
+        base_pop_size = st.slider("种群大小", 20, 500, 100, key="sa_pop_size", disabled=(sa_param_key == 'pop_size'))
+        base_n_gen = st.slider("最大代数", 20, 2000, 100, key="sa_n_gen", disabled=(sa_param_key == 'n_gen'))
+        base_cx_prob = st.slider("交叉概率", 0.0, 1.0, 0.9, 0.05, key="sa_cx_prob", disabled=(sa_param_key == 'crossover_prob'))
+        base_cx_eta = st.slider("交叉分布指数", 1.0, 50.0, 20.0, 1.0, key="sa_cx_eta", disabled=(sa_param_key == 'crossover_eta'))
+        base_mut_prob = st.slider("变异概率", 0.0, 1.0, 0.1, 0.01, key="sa_mut_prob", disabled=(sa_param_key == 'mutation_prob'))
+        base_mut_eta = st.slider("变异分布指数", 1.0, 50.0, 20.0, 1.0, key="sa_mut_eta", disabled=(sa_param_key == 'mutation_eta'))
+
+        base_params = {
+            'pop_size': base_pop_size,
+            'n_gen': base_n_gen,
+            'crossover_prob': base_cx_prob,
+            'crossover_eta': base_cx_eta,
+            'mutation_prob': base_mut_prob,
+            'mutation_eta': base_mut_eta,
+            'constraint_strategy': 'feasibility_rule',
+            'seed': 42,
+        }
+
+        if sa_algo_name == 'NSGA-III':
+            base_n_div = st.slider("参考点划分数", 2, 50, 12, key="sa_nsga3_div", disabled=(sa_param_key == 'n_divisions'))
+            base_params['n_divisions'] = base_n_div
+        elif sa_algo_name == 'MOEA/D':
+            base_n_weights = st.slider("权重向量数", 10, 500, 100, key="sa_moead_w", disabled=(sa_param_key == 'n_weights'))
+            base_neighbor = st.slider("邻域大小", 2, 100, 20, key="sa_moead_n", disabled=(sa_param_key == 'neighbor_size'))
+            base_params['n_weights'] = base_n_weights
+            base_params['neighbor_size'] = base_neighbor
+        elif sa_algo_name == 'SPEA2':
+            base_archive = st.slider("归档集大小", 20, 500, 100, key="sa_spea2_a", disabled=(sa_param_key == 'archive_size'))
+            base_params['archive_size'] = base_archive
+        elif sa_algo_name == 'SMS-EMOA':
+            base_offspring = st.slider("每代子代数", 1, 20, 1, key="sa_sms_o", disabled=(sa_param_key == 'n_offspring'))
+            base_params['n_offspring'] = base_offspring
+
+        st.divider()
+        col_run, col_stop = st.columns(2)
+        with col_run:
+            start_analysis = st.button(
+                "🚀 开始分析",
+                type="primary",
+                use_container_width=True,
+                disabled=st.session_state.sensitivity_running
+            )
+        with col_stop:
+            stop_analysis = st.button(
+                "⏹️ 终止",
+                use_container_width=True,
+                disabled=not st.session_state.sensitivity_running
+            )
+
+    with right_col:
+        total_expected = len(param_values) * sa_n_runs
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        if start_analysis and not st.session_state.sensitivity_running:
+            if len(param_values) == 0:
+                st.error("参数取值列表为空，请检查范围和步长设置")
+            elif sa_start > sa_end:
+                st.error("起始值不能大于终止值")
+            else:
+                st.session_state.sensitivity_running = True
+                st.session_state.sensitivity_results = None
+
+                results_by_param = {}
+                best_front_by_param = {}
+
+                try:
+                    total_completed = 0
+
+                    for p_idx, p_val in enumerate(param_values):
+                        if not st.session_state.sensitivity_running:
+                            break
+
+                        results_for_p = []
+                        best_metric_val = None
+                        best_front = None
+
+                        for r_idx in range(sa_n_runs):
+                            if not st.session_state.sensitivity_running:
+                                break
+
+                            status_text.info(
+                                f"📊 参数值 {p_idx + 1}/{len(param_values)} ({param_labels[sa_param_key]}={p_val}), "
+                                f"重复 {r_idx + 1}/{sa_n_runs}"
+                            )
+
+                            algo = _create_algorithm_with_param(
+                                sa_algo_name, algo_class, base_params, sa_param_key, p_val,
+                                run_seed=42 + p_idx * 100 + r_idx
+                            )
+
+                            curr_progress = total_completed / total_expected
+                            progress_bar.progress(curr_progress)
+
+                            def make_callback(pi, ri, total_done):
+                                def cb(algo_ref, gen, pop, obj, cv):
+                                    if not st.session_state.sensitivity_running:
+                                        algo_ref.stop()
+                                    gen_progress = (total_done + gen / max(1, algo_ref.n_gen)) / total_expected
+                                    progress_bar.progress(gen_progress)
+                                return cb
+
+                            algo.set_callback(make_callback(p_idx, r_idx, total_completed))
+
+                            try:
+                                result = algo.run(sa_problem, verbose=False)
+
+                                true_front = sa_problem.pareto_front() if sa_problem.pareto_front() is not None else None
+                                approx_front = result.pareto_front
+
+                                metrics = {}
+                                if true_front is not None and len(true_front) > 0:
+                                    metrics['GD'] = gd(approx_front, true_front)
+                                    metrics['IGD'] = igd(approx_front, true_front)
+                                if true_front is not None and len(true_front) > 0:
+                                    ref_point = np.maximum(np.max(approx_front, axis=0), np.max(true_front, axis=0)) * 1.1 + 1e-6
+                                else:
+                                    ref_point = np.max(approx_front, axis=0) * 1.1 + 1e-6
+                                metrics['HV'] = hv(approx_front, ref_point)
+
+                                result.metrics = metrics
+                                results_for_p.append(result)
+
+                                if true_front is not None and len(true_front) > 0:
+                                    cmp_metric = metrics.get('IGD', metrics.get('GD', metrics['HV']))
+                                    is_better = (best_metric_val is None) or (cmp_metric < best_metric_val if 'IGD' in metrics or 'GD' in metrics else cmp_metric > best_metric_val)
+                                else:
+                                    cmp_metric = metrics['HV']
+                                    is_better = (best_metric_val is None) or (cmp_metric > best_metric_val)
+
+                                if is_better:
+                                    best_metric_val = cmp_metric
+                                    best_front = approx_front
+
+                                record = ExperimentRecord(
+                                    algorithm_name=sa_algo_name,
+                                    problem_name=sa_problem.name,
+                                    params=algo.get_params(),
+                                    metrics=metrics,
+                                    runtime=result.runtime,
+                                    result=result
+                                )
+                                st.session_state.experiment_history.add_record(record)
+
+                            except Exception as e:
+                                st.error(f"运行错误 (参数={p_val}, 重复={r_idx + 1}): {e}")
+
+                            total_completed += 1
+
+                        results_by_param[p_val] = results_for_p
+                        best_front_by_param[p_val] = best_front
+
+                    st.session_state.sensitivity_results = {
+                        'algorithm': sa_algo_name,
+                        'problem': sa_problem.name,
+                        'param_key': sa_param_key,
+                        'param_label': param_labels[sa_param_key],
+                        'param_values': param_values,
+                        'results_by_param': results_by_param,
+                        'best_front_by_param': best_front_by_param,
+                        'n_runs': sa_n_runs,
+                        'problem_obj': sa_problem,
+                    }
+                    progress_bar.progress(1.0)
+                    status_text.success("✅ 参数灵敏度分析完成！")
+                    st.session_state.sensitivity_running = False
+                    st.rerun()
+
+                except Exception as e:
+                    st.session_state.sensitivity_running = False
+                    st.error(f"分析过程中出错: {e}")
+
+        if stop_analysis and st.session_state.sensitivity_running:
+            st.session_state.sensitivity_running = False
+            st.warning("⚠️ 分析已终止")
+
+        if not st.session_state.sensitivity_results:
+            if not st.session_state.sensitivity_running:
+                st.info("👈 请在左侧配置参数后点击\"开始分析\"")
+            return
+
+        sa_res = st.session_state.sensitivity_results
+        sa_problem_obj = sa_res['problem_obj']
+
+        tab_chart, tab_front, tab_table = st.tabs([
+            "📈 灵敏度折线图",
+            "🎯 帕累托前沿对比",
+            "📋 汇总表格"
+        ])
+
+        with tab_chart:
+            st.subheader(f"{sa_res['param_label']} 对性能指标的影响")
+
+            param_values = sa_res['param_values']
+            metric_list = ['IGD', 'GD', 'HV']
+            means_dict = {}
+            stds_dict = {}
+
+            for metric_name in metric_list:
+                means = []
+                stds = []
+                has_metric = False
+                for pv in param_values:
+                    runs = sa_res['results_by_param'].get(pv, [])
+                    vals = [r.metrics.get(metric_name, np.nan) for r in runs if metric_name in r.metrics]
+                    if vals:
+                        stats = compute_statistics(np.array(vals))
+                        means.append(stats['mean'])
+                        stds.append(stats['std'])
+                        has_metric = True
+                    else:
+                        means.append(np.nan)
+                        stds.append(np.nan)
+                if has_metric:
+                    means_dict[metric_name] = np.array(means)
+                    stds_dict[metric_name] = np.array(stds)
+
+            if means_dict:
+                for metric_name in list(means_dict.keys()):
+                    st.markdown(f"**{metric_name}**")
+                    single_mean = {metric_name: means_dict[metric_name]}
+                    single_std = {metric_name: stds_dict[metric_name]}
+                    y_label = f"{metric_name} {'(越小越好)' if metric_name in ['IGD', 'GD'] else '(越大越好)'}"
+                    fig = plot_sensitivity_line(
+                        param_values,
+                        single_mean,
+                        single_std,
+                        param_name=sa_res['param_label'],
+                        title=f"{sa_res['algorithm']} on {sa_res['problem']} — {metric_name}",
+                        ylabel=y_label,
+                        figsize=(10, 5),
+                        alpha_band=0.25
+                    )
+                    st.pyplot(fig, use_container_width=True)
+            else:
+                st.warning("没有可显示的性能指标数据")
+
+        with tab_front:
+            st.subheader(f"各参数值下最佳帕累托前沿叠加对比")
+
+            best_fronts = sa_res['best_front_by_param']
+            true_front = sa_problem_obj.pareto_front() if sa_problem_obj.pareto_front() is not None else None
+
+            plot_data = {}
+            for pv in param_values:
+                front = best_fronts.get(pv)
+                if front is not None and len(front) > 0:
+                    label = f"{sa_res['param_label']}={pv}"
+                    plot_data[label] = front
+
+            if sa_problem_obj.n_obj == 2:
+                fig = plot_pareto_front_2d(
+                    plot_data,
+                    true_front=true_front,
+                    title=f"帕累托前沿对比 — {sa_res['algorithm']} on {sa_res['problem']}",
+                    show_grid=True
+                )
+                st.pyplot(fig, use_container_width=True)
+            elif sa_problem_obj.n_obj == 3:
+                fig = plot_pareto_front_3d(
+                    plot_data,
+                    true_front=true_front,
+                    title=f"帕累托前沿对比 — {sa_res['algorithm']} on {sa_res['problem']}"
+                )
+                st.pyplot(fig, use_container_width=True)
+            else:
+                fig = plot_parallel_coordinates(
+                    plot_data,
+                    title=f"帕累托前沿对比 — {sa_res['algorithm']} on {sa_res['problem']}"
+                )
+                st.pyplot(fig, use_container_width=True)
+
+        with tab_table:
+            st.subheader(f"性能指标汇总 — {sa_res['param_label']}")
+
+            summary_rows = []
+            for pv in param_values:
+                runs = sa_res['results_by_param'].get(pv, [])
+                row = {sa_res['param_label']: pv, '运行次数': len(runs)}
+                for metric_name in ['IGD', 'GD', 'HV']:
+                    vals = [r.metrics.get(metric_name, np.nan) for r in runs if metric_name in r.metrics]
+                    if vals:
+                        s = compute_statistics(np.array(vals))
+                        row[f'{metric_name}_均值'] = s['mean']
+                        row[f'{metric_name}_标准差'] = s['std']
+                        row[f'{metric_name}_最小值'] = s['min']
+                        row[f'{metric_name}_最大值'] = s['max']
+                    else:
+                        row[f'{metric_name}_均值'] = np.nan
+                        row[f'{metric_name}_标准差'] = np.nan
+                        row[f'{metric_name}_最小值'] = np.nan
+                        row[f'{metric_name}_最大值'] = np.nan
+                summary_rows.append(row)
+
+            summary_df = pd.DataFrame(summary_rows)
+
+            display_cols = [sa_res['param_label'], '运行次数']
+            for m in ['IGD', 'GD', 'HV']:
+                if f'{m}_均值' in summary_df.columns and not summary_df[f'{m}_均值'].isna().all():
+                    display_cols.extend([f'{m}_均值', f'{m}_标准差', f'{m}_最小值', f'{m}_最大值'])
+
+            display_df = summary_df[display_cols].copy()
+
+            format_dict = {}
+            for col in display_df.columns:
+                if col != sa_res['param_label'] and col != '运行次数':
+                    format_dict[col] = '{:.6f}'
+
+            st.dataframe(
+                display_df.style.format(format_dict),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.divider()
+            col_dl1, col_dl2 = st.columns([1, 3])
+            with col_dl1:
+                csv_data = display_df.to_csv(index=False, encoding='utf-8-sig')
+                fname = f"sensitivity_{sa_res['algorithm']}_{sa_res['problem']}_{sa_res['param_key']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                st.download_button(
+                    "📥 导出汇总表格为 CSV",
+                    csv_data,
+                    fname,
+                    "text/csv",
+                    use_container_width=True
+                )
+            with col_dl2:
+                st.caption("CSV 文件包含各参数值下 IGD/GD/HV 的均值、标准差、最小值和最大值")
+
+
 def history_tab():
     """实验记录标签页"""
     st.header("📋 实验记录")
@@ -901,12 +1407,13 @@ def main():
     problem = sidebar_problem_config()
     sidebar_algorithm_config()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📚 问题定义",
         "▶️ 运行优化",
         "📊 结果可视化",
         "🔬 对比分析",
         "🎯 决策支持",
+        "📐 参数灵敏度分析",
         "📋 实验记录"
     ])
 
@@ -930,6 +1437,9 @@ def main():
         decision_support_tab()
 
     with tab6:
+        sensitivity_analysis_tab()
+
+    with tab7:
         history_tab()
 
     st.divider()

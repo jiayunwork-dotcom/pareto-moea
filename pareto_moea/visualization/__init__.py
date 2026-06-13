@@ -7,6 +7,7 @@ from .plots import (
     plot_convergence,
     plot_boxplot,
     plot_generation_animation,
+    plot_sensitivity_line,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "plot_convergence",
     "plot_boxplot",
     "plot_generation_animation",
+    "plot_sensitivity_line",
 ]

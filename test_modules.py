@@ -202,7 +202,8 @@ def test_visualization():
         plot_pareto_front_3d,
         plot_parallel_coordinates,
         plot_convergence,
-        plot_boxplot
+        plot_boxplot,
+        plot_sensitivity_line
     )
     from pareto_moea.problems import ZDT1, DTLZ2
     import numpy as np
@@ -241,6 +242,25 @@ def test_visualization():
     }
     fig = plot_boxplot(box_data, title="Boxplot")
     print(f"✓ 箱线图")
+
+    # 灵敏度折线图（新增）
+    param_values = [50, 100, 150, 200, 250, 300]
+    means = {
+        'IGD': np.array([0.05, 0.03, 0.025, 0.022, 0.021, 0.02]),
+        'HV': np.array([0.7, 0.78, 0.82, 0.84, 0.85, 0.855]),
+    }
+    stds = {
+        'IGD': np.array([0.01, 0.008, 0.006, 0.005, 0.004, 0.004]),
+        'HV': np.array([0.03, 0.025, 0.02, 0.018, 0.015, 0.015]),
+    }
+    fig = plot_sensitivity_line(
+        param_values,
+        means,
+        stds,
+        param_name='种群大小',
+        title='参数灵敏度测试'
+    )
+    print(f"✓ 灵敏度折线图（带误差带）")
 
     print()
     return True

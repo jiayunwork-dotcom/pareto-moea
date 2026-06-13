@@ -940,3 +940,74 @@ def plot_generation_animation(
 
     fig.tight_layout()
     return fig
+
+
+def plot_sensitivity_line(
+    param_values,
+    metric_means,
+    metric_stds=None,
+    param_name="Parameter",
+    title="Parameter Sensitivity Analysis",
+    xlabel=None,
+    ylabel="Metric Value",
+    figsize=(10, 7),
+    colors=None,
+    markers=None,
+    show_grid=True,
+    show_legend=True,
+    alpha_band=0.2,
+):
+    fig, ax = plt.subplots(figsize=figsize)
+
+    default_colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    default_markers = ["o", "s", "^", "D", "v", "<", ">", "p", "*", "h"]
+
+    if colors is None:
+        colors = default_colors
+    if markers is None:
+        markers = default_markers
+
+    if xlabel is None:
+        xlabel = param_name
+
+    param_values = np.asarray(param_values)
+    metric_names = list(metric_means.keys())
+
+    for i, metric_name in enumerate(metric_names):
+        color = colors[i % len(colors)]
+        marker = markers[i % len(markers)]
+        means = np.asarray(metric_means[metric_name], dtype=float)
+
+        ax.plot(
+            param_values,
+            means,
+            color=color,
+            marker=marker,
+            markersize=8,
+            linewidth=2,
+            label=metric_name
+        )
+
+        if metric_stds is not None and metric_name in metric_stds:
+            stds = np.asarray(metric_stds[metric_name], dtype=float)
+            ax.fill_between(
+                param_values,
+                means - stds,
+                means + stds,
+                color=color,
+                alpha=alpha_band,
+                label=f"{metric_name} ± Std" if i == 0 else None
+            )
+
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+
+    if show_grid:
+        ax.grid(True, alpha=0.3)
+
+    if show_legend:
+        ax.legend(loc="best", fontsize=10)
+
+    fig.tight_layout()
+    return fig
