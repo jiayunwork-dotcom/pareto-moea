@@ -21,7 +21,8 @@ from pareto_moea.algorithms import (
 
 from pareto_moea.metrics import (
     gd, igd, hv, spacing, spacing_std, spread,
-    pairwise_wilcoxon, significance_level, compute_statistics
+    pairwise_wilcoxon, significance_level, compute_statistics,
+    ranksums_test
 )
 
 from pareto_moea.visualization import (
@@ -154,6 +155,15 @@ def init_session_state():
 
     if 'benchmark_progress' not in st.session_state:
         st.session_state.benchmark_progress = 0
+
+    if 'benchmark_history' not in st.session_state:
+        st.session_state.benchmark_history = []
+
+    if 'benchmark_selected_history' not in st.session_state:
+        st.session_state.benchmark_selected_history = None
+
+    if 'benchmark_metric_weights' not in st.session_state:
+        st.session_state.benchmark_metric_weights = {}
 
 
 def sidebar_problem_config():
@@ -2464,15 +2474,25 @@ def _compute_benchmark_stats(results_by_repeat, selected_metrics):
     return stats
 
 
-def _compute_benchmark_rankings(benchmark_results, selected_metrics):
-    """计算综合排名"""
+def _compute_benchmark_rankings(benchmark_results, selected_metrics, metric_weights=None):
+    """计算综合排名（支持加权）
+
+    Args:
+        benchmark_results: 评测结果字典
+        selected_metrics: 选中的指标列表
+        metric_weights: 指标权重字典，None表示全部权重为1.0
+    """
     algorithms = list(benchmark_results['results'].keys())
     problems = list(benchmark_results['results'][algorithms[0]].keys()) if algorithms else []
+
+    if metric_weights is None:
+        metric_weights = {m: 1.0 for m in selected_metrics}
 
     rankings = {metric: {} for metric in selected_metrics}
     overall_scores = {algo: 0 for algo in algorithms}
 
     for metric in selected_metrics:
+        weight = metric_weights.get(metric, 1.0)
         for problem in problems:
             algo_values = []
             for algo in algorithms:
@@ -2494,7 +2514,7 @@ def _compute_benchmark_rankings(benchmark_results, selected_metrics):
                 if problem not in rankings[metric]:
                     rankings[metric][problem] = {}
                 rankings[metric][problem][algo] = rank + 1
-                overall_scores[algo] += (rank + 1)
+                overall_scores[algo] += (rank + 1) * weight
 
     overall_ranking = sorted(overall_scores.items(), key=lambda x: x[1])
 
@@ -2506,6 +2526,154 @@ def _format_mean_std(mean_val, std_val):
     if np.isnan(mean_val) or np.isnan(std_val):
         return "N/A"
     return f"{mean_val:.4f}(±{std_val:.4f})"
+
+
+def _compute_benchmark_significance(benchmark_results, selected_metrics):
+    """计算显著性检验标记和胜出次数
+
+    使用 Wilcoxon 秩和检验 (ranksums) 两两比较同一问题同一指标下各算法的重复运行值。
+    p<0.05 标注 †，p<0.01 标注 ‡。
+
+    Returns:
+        significance_markers: dict[metric][problem][algo] -> str ('' or '†' or '‡')
+        win_counts: dict[algo] -> int (每个算法显著胜出的总次数)
+    """
+    algorithms = list(benchmark_results['results'].keys())
+    problems = (list(benchmark_results['results'][algorithms[0]].keys())
+                if algorithms else [])
+
+    significance_markers = {m: {p: {a: '' for a in algorithms} for p in problems}
+                            for m in selected_metrics}
+    win_counts = {a: 0 for a in algorithms}
+
+    for metric in selected_metrics:
+        lower_is_better = metric in ['IGD', 'Spacing']
+
+        for problem in problems:
+            algo_values = {}
+            for algo in algorithms:
+                repeats = benchmark_results['results'][algo][problem]['repeats']
+                vals = [r['metrics'].get(metric, np.nan) for r in repeats
+                        if r['error'] is None and metric in r['metrics']]
+                if vals:
+                    algo_values[algo] = np.array(vals, dtype=float)
+
+            algo_list = list(algo_values.keys())
+            for i in range(len(algo_list)):
+                for j in range(i + 1, len(algo_list)):
+                    a1, a2 = algo_list[i], algo_list[j]
+                    v1, v2 = algo_values[a1], algo_values[a2]
+
+                    if len(v1) < 3 or len(v2) < 3:
+                        continue
+
+                    try:
+                        _, p_two = ranksums_test(v1, v2, alternative='two-sided')
+                    except Exception:
+                        continue
+
+                    if np.isnan(p_two):
+                        continue
+
+                    m1, m2 = np.nanmean(v1), np.nanmean(v2)
+                    if lower_is_better:
+                        if m1 < m2:
+                            better, worse = a1, a2
+                        else:
+                            better, worse = a2, a1
+                    else:
+                        if m1 > m2:
+                            better, worse = a1, a2
+                        else:
+                            better, worse = a2, a1
+
+                    if p_two < 0.01:
+                        marker = '\u2021'
+                        significance_markers[metric][problem][better] += marker
+                        win_counts[better] += 1
+                    elif p_two < 0.05:
+                        marker = '\u2020'
+                        significance_markers[metric][problem][better] += marker
+                        win_counts[better] += 1
+
+    return significance_markers, win_counts
+
+
+def _get_problem_default_nvar(problem_name):
+    """获取问题的默认变量数"""
+    problem = _create_problem_by_name(problem_name)
+    if problem:
+        return problem.n_var
+    return 0
+
+
+def _get_problem_default_nobj(problem_name):
+    """获取问题的默认目标数"""
+    problem = _create_problem_by_name(problem_name)
+    if problem:
+        return problem.n_obj
+    return 0
+
+
+def _save_benchmark_to_history():
+    """将当前评测结果保存到历史列表（最多保留10次）"""
+    if (st.session_state.benchmark_results is None
+            or st.session_state.benchmark_results['end_time'] is None):
+        return
+
+    history_entry = {
+        'id': datetime.now().strftime('%Y%m%d_%H%M%S_%f'),
+        'timestamp': datetime.now(),
+        'config': json.loads(json.dumps(st.session_state.benchmark_results['config'],
+                                        default=str)),
+        'results': st.session_state.benchmark_results,
+    }
+
+    st.session_state.benchmark_history.insert(0, history_entry)
+
+    if len(st.session_state.benchmark_history) > 10:
+        st.session_state.benchmark_history = st.session_state.benchmark_history[:10]
+
+
+def _compute_ranking_changes(current_ranking, history_ranking):
+    """计算两次评测之间的综合排名变动
+
+    Args:
+        current_ranking: [(algo, score), ...] 当前综合排名
+        history_ranking: [(algo, score), ...] 历史综合排名
+
+    Returns:
+        list of dict: 每个算法的排名变动信息
+    """
+    cur_pos = {algo: rank + 1 for rank, (algo, _) in enumerate(current_ranking)}
+    hist_pos = {algo: rank + 1 for rank, (algo, _) in enumerate(history_ranking)}
+
+    all_algos = set(cur_pos.keys()) | set(hist_pos.keys())
+    changes = []
+
+    for algo in sorted(all_algos):
+        cur = cur_pos.get(algo, '-')
+        hist = hist_pos.get(algo, '-')
+        if isinstance(cur, int) and isinstance(hist, int):
+            delta = hist - cur
+            if delta > 0:
+                direction = f"上升{delta}位"
+            elif delta < 0:
+                direction = f"下降{abs(delta)}位"
+            else:
+                direction = "保持不变"
+            change_text = f"{algo}: {hist}→{cur}, {direction}"
+        else:
+            change_text = f"{algo}: 仅{'当前' if cur != '-' else '历史'}评测存在"
+        changes.append({
+            'algo': algo,
+            'from': hist,
+            'to': cur,
+            'delta': delta if (isinstance(cur, int) and isinstance(hist, int)) else None,
+            'text': change_text
+        })
+
+    return changes
 
 
 def _export_benchmark_csv(benchmark_results, selected_metrics):
@@ -2590,6 +2758,40 @@ def _render_benchmark_config():
         st.warning("⚠️ 请至少选择2个测试函数")
     elif n_problems > 10:
         st.warning("⚠️ 最多只能选择10个测试函数")
+
+    if n_problems >= 1:
+        has_dtlz_3obj = False
+        for pname in selected_problems:
+            if pname.startswith('DTLZ'):
+                nobj = _get_problem_default_nobj(pname)
+                if nobj >= 3:
+                    has_dtlz_3obj = True
+                    break
+        if has_dtlz_3obj and 'NSGA-II' in selected_algorithms:
+            st.markdown(
+                '<div style="background-color: #FFF3E0; padding: 10px; border-left: 5px solid #FF9800; '
+                'border-radius: 4px; margin: 8px 0;">'
+                '<span style="color: #E65100;">⚠️ '
+                '<b>NSGA-II</b>不适合3目标以上问题，建议改用NSGA-III或MOEA/D</span>'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+    if n_problems >= 2:
+        nvars = [_get_problem_default_nvar(p) for p in selected_problems]
+        nvars_valid = [v for v in nvars if v > 0]
+        if len(nvars_valid) >= 2:
+            max_var, min_var = max(nvars_valid), min(nvars_valid)
+            if min_var > 0 and (max_var / min_var) > 5:
+                st.markdown(
+                    '<div style="background-color: #FFF3E0; padding: 10px; border-left: 5px solid #FF9800; '
+                    'border-radius: 4px; margin: 8px 0;">'
+                    '<span style="color: #E65100;">💡 '
+                    f'所选问题的变量维度差异较大({min_var}~{max_var})，'
+                    '建议统一变量数或分批评测</span>'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
 
     st.divider()
     st.markdown("**3. 统一运行参数**")
@@ -2826,6 +3028,7 @@ def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics
         st.session_state.benchmark_results['current_problem'] = None
         st.session_state.benchmark_results['current_repeat'] = None
         st.session_state.benchmark_results['end_time'] = datetime.now()
+        _save_benchmark_to_history()
         st.rerun()
 
     except Exception as e:
@@ -2834,50 +3037,133 @@ def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics
 
 
 def _render_benchmark_report():
-    """渲染右侧报告展示区"""
-    benchmark_results = st.session_state.benchmark_results
+    """渲染右侧报告展示区（集成历史记录、显著性检验、权重排名）"""
 
-    if benchmark_results is None:
+    st.markdown("#### 📜 历史评测")
+    history = st.session_state.benchmark_history
+    history_options = ["-- 当前评测结果 --"]
+    if history:
+        for h in history:
+            ts = h['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            cfg = h.get('config', {})
+            algos = ",".join(cfg.get('algorithms', []))
+            probs = ",".join(cfg.get('problems', []))
+            history_options.append(f"{ts} | {algos} | {probs}")
+
+    selected_history_idx = st.selectbox(
+        "选择历史评测记录（切换查看/对比）",
+        range(len(history_options)),
+        format_func=lambda i: history_options[i],
+        index=0,
+        key="benchmark_history_selector"
+    )
+
+    display_benchmark_results = st.session_state.benchmark_results
+    display_config = (display_benchmark_results['config']
+                      if display_benchmark_results else None)
+    is_history_view = selected_history_idx > 0
+
+    if is_history_view:
+        hist_entry = history[selected_history_idx - 1]
+        display_benchmark_results = hist_entry['results']
+        display_config = display_benchmark_results['config']
+        st.info(f"📜 正在查看历史评测: {history_options[selected_history_idx]}")
+        if (st.session_state.benchmark_results is not None
+                and st.session_state.benchmark_results['completed'] > 0):
+            try:
+                cur_cfg = st.session_state.benchmark_results['config']
+                cur_metrics = cur_cfg['metrics']
+                cur_rankings, cur_overall, _ = _compute_benchmark_rankings(
+                    st.session_state.benchmark_results, cur_metrics
+                )
+                hist_metrics = display_config['metrics']
+                hist_rankings, hist_overall, _ = _compute_benchmark_rankings(
+                    display_benchmark_results, hist_metrics
+                )
+                if cur_metrics == hist_metrics:
+                    changes = _compute_ranking_changes(cur_overall, hist_overall)
+                    st.markdown("**🔀 对比变化（历史→当前）综合排名变动：**")
+                    change_lines = []
+                    for c in changes:
+                        if c['delta'] is not None and c['delta'] > 0:
+                            emoji = "🟢"
+                        elif c['delta'] is not None and c['delta'] < 0:
+                            emoji = "🔴"
+                        else:
+                            emoji = "⚪"
+                        change_lines.append(f"{emoji} {c['text']}")
+                    st.markdown("  \n".join(change_lines))
+            except Exception:
+                pass
+
+    if display_benchmark_results is None:
         st.info("👈 请在左侧配置评测参数后点击\"启动批量评测\"")
         return
 
-    config = benchmark_results['config']
-    selected_metrics = config['metrics']
+    if display_config is None:
+        return
+    selected_metrics = display_config['metrics']
 
-    if st.session_state.benchmark_running:
+    if st.session_state.benchmark_running and not is_history_view:
         st.subheader("🔄 评测进行中...")
 
         progress = st.session_state.benchmark_progress
         progress_bar = st.progress(progress)
         status_text = st.empty()
 
-        completed = benchmark_results['completed']
-        total = benchmark_results['total']
-        current_algo = benchmark_results['current_algo']
-        current_problem = benchmark_results['current_problem']
-        current_repeat = benchmark_results['current_repeat']
+        completed = display_benchmark_results['completed']
+        total = display_benchmark_results['total']
+        current_algo = display_benchmark_results['current_algo']
+        current_problem = display_benchmark_results['current_problem']
+        current_repeat = display_benchmark_results['current_repeat']
 
         status_text.info(
             f"📊 进度: {completed}/{total} 个组合 "
             f"({progress * 100:.1f}%) | "
             f"当前: {current_algo} + {current_problem} "
-            f"(重复 {current_repeat}/{config['n_repeats']})"
+            f"(重复 {current_repeat}/{display_config['n_repeats']})"
         )
 
-    if benchmark_results['completed'] > 0:
+    if display_benchmark_results['completed'] > 0:
         st.subheader("📈 评测结果")
 
+        with st.expander("⚖️ 指标权重配置（调整后排名实时刷新）", expanded=False):
+            st.caption("每个(问题,指标)的排名分将乘以对应指标的权重后求和，得到综合排名分数")
+            metric_weights = {}
+            w_cols = st.columns(len(selected_metrics))
+            for i, metric in enumerate(selected_metrics):
+                default_w = st.session_state.benchmark_metric_weights.get(metric, 1.0)
+                with w_cols[i]:
+                    w = st.slider(
+                        f"{metric} 权重",
+                        min_value=0.1,
+                        max_value=5.0,
+                        value=float(default_w),
+                        step=0.1,
+                        key=f"weight_slider_{metric}_{selected_history_idx}"
+                    )
+                    metric_weights[metric] = w
+                    st.caption(f"权重值: {w:.1f}")
+            st.session_state.benchmark_metric_weights.update(metric_weights)
+
         rankings, overall_ranking, overall_scores = _compute_benchmark_rankings(
-            benchmark_results, selected_metrics
+            display_benchmark_results, selected_metrics, metric_weights
+        )
+
+        significance_markers, win_counts = _compute_benchmark_significance(
+            display_benchmark_results, selected_metrics
         )
 
         for metric in selected_metrics:
             st.markdown(f"### {metric} 汇总表")
             metric_optim = "(越小越好)" if metric in ['IGD', 'Spacing'] else "(越大越好)"
-            st.caption(f"{metric} {metric_optim}")
+            st.caption(
+                f"{metric} {metric_optim} | "
+                "显著性标记: ‡ p<0.01, † p<0.05 (重复次数<3不标注)"
+            )
 
-            algo_names = config['algorithms']
-            problem_names = config['problems']
+            algo_names = display_config['algorithms']
+            problem_names = display_config['problems']
 
             table_data = []
             best_values = {}
@@ -2885,7 +3171,7 @@ def _render_benchmark_report():
             for problem in problem_names:
                 valid_values = []
                 for algo in algo_names:
-                    stats = benchmark_results['results'][algo][problem]['stats']
+                    stats = display_benchmark_results['results'][algo][problem]['stats']
                     if metric in stats and stats[metric]['count'] > 0:
                         valid_values.append(stats[metric]['mean'])
 
@@ -2898,32 +3184,52 @@ def _render_benchmark_report():
             for algo in algo_names:
                 row = {'算法': algo}
                 for problem in problem_names:
-                    stats = benchmark_results['results'][algo][problem]['stats']
+                    stats = display_benchmark_results['results'][algo][problem]['stats']
+                    marker = significance_markers.get(metric, {}).get(problem, {}).get(algo, '')
                     if metric in stats and stats[metric]['count'] > 0:
                         cell_value = _format_mean_std(stats[metric]['mean'], stats[metric]['std'])
                     else:
                         cell_value = "N/A"
+                    if marker:
+                        cell_value = f"{cell_value}<sup style='color:#d32f2f; font-weight:bold;'>{marker}</sup>"
                     row[problem] = cell_value
                 table_data.append(row)
+
+            win_row = {'算法': '<b>显著胜出次数</b>'}
+            for problem in problem_names:
+                win_counts_per_problem = {}
+                for algo in algo_names:
+                    marker = significance_markers.get(metric, {}).get(problem, {}).get(algo, '')
+                    win_counts_per_problem[algo] = len([c for c in marker])
+                cell_parts = []
+                for algo in algo_names:
+                    wc = win_counts_per_problem[algo]
+                    if wc > 0:
+                        cell_parts.append(f"{algo}:{wc}")
+                win_row[problem] = "<br>".join(cell_parts) if cell_parts else "-"
+            table_data.append(win_row)
 
             df = pd.DataFrame(table_data)
 
             def highlight_best(row):
                 styles = [''] * len(row)
+                if row['算法'] == '<b>显著胜出次数</b>':
+                    return ['background-color: #FFF8E1; color: black; font-weight: bold;'] * len(row)
                 for i, problem in enumerate(problem_names):
                     col_idx = i + 1
-                    stats = benchmark_results['results'][row['算法']][problem]['stats']
+                    stats = display_benchmark_results['results'][row['算法']][problem]['stats']
                     if metric in stats and stats[metric]['count'] > 0:
                         if abs(stats[metric]['mean'] - best_values.get(problem, float('inf'))) < 1e-10:
                             styles[col_idx] = 'background-color: #90EE90; color: black;'
                 return styles
 
-            st.dataframe(
-                df.style.apply(highlight_best, axis=1),
-                use_container_width=True,
-                hide_index=True,
-                key=f"df_benchmark_{metric}"
-            )
+            try:
+                styled_df = df.style.apply(highlight_best, axis=1)
+                html_table = styled_df.to_html(escape=False, index=False)
+                st.markdown(html_table, unsafe_allow_html=True)
+            except Exception:
+                st.dataframe(df, use_container_width=True, hide_index=True,
+                             key=f"df_benchmark_{metric}_{selected_history_idx}")
 
         st.markdown("### 🏆 综合排名")
         ranking_data = []
@@ -2931,22 +3237,23 @@ def _render_benchmark_report():
             ranking_data.append({
                 '排名': rank + 1,
                 '算法': algo,
-                '总分': score
+                '总分': score,
+                '显著胜出次数': win_counts.get(algo, 0)
             })
         ranking_df = pd.DataFrame(ranking_data)
         st.dataframe(
-            ranking_df.style.format({'总分': '{:.0f}'}),
+            ranking_df.style.format({'总分': '{:.1f}', '显著胜出次数': '{:d}'}),
             use_container_width=True,
             hide_index=True,
-            key="df_benchmark_ranking"
+            key=f"df_benchmark_ranking_{selected_history_idx}"
         )
 
         st.divider()
         st.markdown("### 📋 详细结果")
 
-        for algo in config['algorithms']:
-            for problem in config['problems']:
-                data = benchmark_results['results'][algo][problem]
+        for algo in display_config['algorithms']:
+            for problem in display_config['problems']:
+                data = display_benchmark_results['results'][algo][problem]
                 has_error = data['has_error']
                 error_tag = " ❌" if has_error else ""
 
@@ -2972,7 +3279,7 @@ def _render_benchmark_report():
                     if detail_rows:
                         detail_df = pd.DataFrame(detail_rows)
                         st.dataframe(detail_df, use_container_width=True, hide_index=True,
-                                     key=f"df_benchmark_detail_{algo}_{problem}")
+                                     key=f"df_benchmark_detail_{algo}_{problem}_{selected_history_idx}")
 
                     if data['stats']:
                         st.markdown("**统计值:**")
@@ -2996,7 +3303,9 @@ def _render_benchmark_report():
                     if last_pop is not None:
                         st.markdown("**目标空间散点图（最后一次重复结果）:**")
                         problem_obj = _create_problem_by_name(problem)
-                        true_front = problem_obj.pareto_front() if problem_obj and problem_obj.pareto_front() is not None else None
+                        true_front = (problem_obj.pareto_front()
+                                      if problem_obj and problem_obj.pareto_front() is not None
+                                      else None)
 
                         if last_pop.shape[1] == 2:
                             fig = plot_pareto_front_2d(
@@ -3022,7 +3331,7 @@ def _render_benchmark_report():
         st.divider()
         col_dl1, col_dl2 = st.columns([1, 3])
         with col_dl1:
-            csv_data = _export_benchmark_csv(benchmark_results, selected_metrics)
+            csv_data = _export_benchmark_csv(display_benchmark_results, selected_metrics)
             fname = f"benchmark_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             st.download_button(
                 "📥 导出完整报告",
@@ -3030,7 +3339,7 @@ def _render_benchmark_report():
                 fname,
                 "text/csv",
                 use_container_width=True,
-                key="btn_benchmark_export"
+                key=f"btn_benchmark_export_{selected_history_idx}"
             )
         with col_dl2:
             st.caption("CSV文件包含所有组合所有重复的原始指标数据、统计值和运行信息")

@@ -36,6 +36,37 @@ def wilcoxon_test(x: np.ndarray, y: np.ndarray,
         return np.nan, np.nan
 
 
+def ranksums_test(x: np.ndarray, y: np.ndarray,
+                  alternative: str = 'two-sided') -> Tuple[float, float]:
+    """Wilcoxon秩和检验 (Mann-Whitney U检验)
+
+    用于比较两组独立样本是否存在显著差异。
+    适用于两组重复运行次数可以不同的算法性能对比。
+
+    Args:
+        x: 第一组样本，形状为 (n_samples,)
+        y: 第二组样本，形状为 (m_samples,)
+        alternative: 备择假设，'two-sided' | 'less' | 'greater'
+
+    Returns:
+        (statistic, p_value) 检验统计量和p值
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    x_valid = x[~np.isnan(x)]
+    y_valid = y[~np.isnan(y)]
+
+    if len(x_valid) < 3 or len(y_valid) < 3:
+        return np.nan, np.nan
+
+    try:
+        result = stats.ranksums(x_valid, y_valid, alternative=alternative)
+        return result.statistic, result.pvalue
+    except ValueError:
+        return np.nan, np.nan
+
+
 def pairwise_wilcoxon(data: Dict[str, np.ndarray],
                       alternative: str = 'two-sided') -> Tuple[np.ndarray, List[str]]:
     """两两Wilcoxon秩和检验

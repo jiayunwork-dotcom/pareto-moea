@@ -11,6 +11,7 @@ from .indicators import (
 
 from .stats import (
     wilcoxon_test,
+    ranksums_test,
     pairwise_wilcoxon,
     significance_level,
     compute_statistics
@@ -30,6 +31,7 @@ __all__ = [
     'spacing_std', 'spacing_sd',
     'spread',
     'wilcoxon_test',
+    'ranksums_test',
     'pairwise_wilcoxon',
     'significance_level',
     'compute_statistics'
