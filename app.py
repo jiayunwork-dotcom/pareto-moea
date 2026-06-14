@@ -159,6 +159,9 @@ def init_session_state():
     if 'benchmark_pending_start' not in st.session_state:
         st.session_state.benchmark_pending_start = None
 
+    if 'benchmark_loop_params' not in st.session_state:
+        st.session_state.benchmark_loop_params = None
+
     if 'benchmark_history' not in st.session_state:
         st.session_state.benchmark_history = []
 
@@ -2710,6 +2713,19 @@ def benchmark_tab():
 
     left_col, right_col = st.columns([1, 2], gap="large")
 
+    if (st.session_state.benchmark_running
+            and st.session_state.benchmark_loop_params is not None
+            and (st.session_state.benchmark_results is None
+                 or st.session_state.benchmark_results.get('end_time') is None)):
+        params = st.session_state.benchmark_loop_params
+        _run_benchmark_loop(
+            params['algorithms'], params['problems'], params['metrics'],
+            params['n_gen'], params['pop_size'], params['n_repeats'],
+            params['seed_start']
+        )
+        st.session_state.benchmark_loop_params = None
+        st.rerun()
+
     with left_col:
         _render_benchmark_config()
 
@@ -2922,7 +2938,7 @@ def _render_benchmark_config():
 
 def _start_benchmark(selected_algorithms, selected_problems, selected_metrics,
                      n_gen, pop_size, n_repeats, seed_start, total_combinations):
-    """启动批量评测"""
+    """启动批量评测（仅初始化状态，不执行实际评测，避免回调长耗时导致状态丢失）"""
     config = {
         'algorithms': selected_algorithms,
         'problems': selected_problems,
@@ -2960,8 +2976,17 @@ def _start_benchmark(selected_algorithms, selected_problems, selected_metrics,
         'end_time': None
     }
 
-    _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics,
-                       n_gen, pop_size, n_repeats, seed_start)
+    st.session_state.benchmark_loop_params = {
+        'algorithms': selected_algorithms,
+        'problems': selected_problems,
+        'metrics': selected_metrics,
+        'n_gen': n_gen,
+        'pop_size': pop_size,
+        'n_repeats': n_repeats,
+        'seed_start': seed_start
+    }
+
+    st.rerun()
 
 
 def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics,
@@ -3071,11 +3096,12 @@ def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics
         _save_benchmark_to_history()
         progress_placeholder.empty()
         status_placeholder.empty()
-        st.rerun()
 
     except Exception as e:
         st.session_state.benchmark_running = False
         st.error(f"❌ 评测过程中发生错误: {e}")
+        if 'benchmark_results' in st.session_state and st.session_state.benchmark_results:
+            st.session_state.benchmark_results['end_time'] = datetime.now()
 
 
 def _render_benchmark_report():
