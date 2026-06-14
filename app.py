@@ -143,6 +143,18 @@ def init_session_state():
     if 'monitor_template_loaded' not in st.session_state:
         st.session_state.monitor_template_loaded = False
 
+    if 'benchmark_config' not in st.session_state:
+        st.session_state.benchmark_config = None
+
+    if 'benchmark_results' not in st.session_state:
+        st.session_state.benchmark_results = None
+
+    if 'benchmark_running' not in st.session_state:
+        st.session_state.benchmark_running = False
+
+    if 'benchmark_progress' not in st.session_state:
+        st.session_state.benchmark_progress = 0
+
 
 def sidebar_problem_config():
     """侧边栏：问题配置"""
@@ -2368,6 +2380,662 @@ def history_tab():
         st.dataframe(summary, use_container_width=True, key="df_history_summary")
 
 
+def _create_problem_by_name(problem_name):
+    """根据问题名称创建问题实例"""
+    for series, problems in PROBLEM_MAP.items():
+        if problem_name in problems:
+            problem_class = problems[problem_name]
+            if series == 'DTLZ系列':
+                return problem_class(n_obj=3, k=5)
+            elif series == 'WFG系列':
+                return problem_class(n_obj=3, k=4)
+            else:
+                return problem_class(n_var=30)
+    return None
+
+
+def _create_algorithm_by_name(algo_name, pop_size, n_gen, seed):
+    """根据算法名称创建算法实例"""
+    algo_class = ALGORITHM_MAP[algo_name]
+
+    base_params = {
+        'pop_size': pop_size,
+        'n_gen': n_gen,
+        'crossover_prob': 0.9,
+        'crossover_eta': 20.0,
+        'mutation_prob': 0.1,
+        'mutation_eta': 20.0,
+        'constraint_strategy': 'feasibility_rule',
+        'seed': seed,
+    }
+
+    extra = {}
+    if algo_name == 'NSGA-III':
+        extra['n_divisions'] = 12
+    elif algo_name == 'MOEA/D':
+        extra['n_weights'] = pop_size
+        extra['neighbor_size'] = 20
+    elif algo_name == 'SPEA2':
+        extra['archive_size'] = pop_size
+    elif algo_name == 'SMS-EMOA':
+        extra['n_offspring'] = 1
+
+    return algo_class(**base_params, **extra)
+
+
+def _compute_benchmark_metrics(approx_front, problem, selected_metrics):
+    """计算指定的评测指标"""
+    metrics = {}
+    true_front = problem.pareto_front() if problem.pareto_front() is not None else None
+
+    if 'IGD' in selected_metrics and true_front is not None and len(true_front) > 0:
+        metrics['IGD'] = igd(approx_front, true_front)
+
+    if 'Spacing' in selected_metrics:
+        metrics['Spacing'] = spacing(approx_front)
+
+    if 'HV' in selected_metrics:
+        if true_front is not None and len(true_front) > 0:
+            ref_point = np.maximum(np.max(approx_front, axis=0), np.max(true_front, axis=0)) * 1.1 + 1e-6
+        else:
+            ref_point = np.max(approx_front, axis=0) * 1.1 + 1e-6
+        metrics['HV'] = hv(approx_front, ref_point)
+
+    return metrics
+
+
+def _compute_benchmark_stats(results_by_repeat, selected_metrics):
+    """计算统计值（均值和标准差）"""
+    stats = {}
+    for metric in selected_metrics:
+        values = [r['metrics'].get(metric, np.nan) for r in results_by_repeat if r['error'] is None]
+        if values:
+            stats[metric] = {
+                'mean': np.mean(values),
+                'std': np.std(values),
+                'count': len(values)
+            }
+        else:
+            stats[metric] = {
+                'mean': np.nan,
+                'std': np.nan,
+                'count': 0
+            }
+    return stats
+
+
+def _compute_benchmark_rankings(benchmark_results, selected_metrics):
+    """计算综合排名"""
+    algorithms = list(benchmark_results['results'].keys())
+    problems = list(benchmark_results['results'][algorithms[0]].keys()) if algorithms else []
+
+    rankings = {metric: {} for metric in selected_metrics}
+    overall_scores = {algo: 0 for algo in algorithms}
+
+    for metric in selected_metrics:
+        for problem in problems:
+            algo_values = []
+            for algo in algorithms:
+                stats = benchmark_results['results'][algo][problem]['stats']
+                if metric in stats and stats[metric]['count'] > 0:
+                    algo_values.append((algo, stats[metric]['mean']))
+
+            if len(algo_values) < 2:
+                continue
+
+            if metric in ['IGD', 'Spacing']:
+                algo_values.sort(key=lambda x: x[1])
+            else:
+                algo_values.sort(key=lambda x: -x[1])
+
+            for rank, (algo, val) in enumerate(algo_values):
+                if metric not in rankings:
+                    rankings[metric] = {}
+                if problem not in rankings[metric]:
+                    rankings[metric][problem] = {}
+                rankings[metric][problem][algo] = rank + 1
+                overall_scores[algo] += (rank + 1)
+
+    overall_ranking = sorted(overall_scores.items(), key=lambda x: x[1])
+
+    return rankings, overall_ranking, overall_scores
+
+
+def _format_mean_std(mean_val, std_val):
+    """格式化均值±标准差显示"""
+    if np.isnan(mean_val) or np.isnan(std_val):
+        return "N/A"
+    return f"{mean_val:.4f}(±{std_val:.4f})"
+
+
+def _export_benchmark_csv(benchmark_results, selected_metrics):
+    """导出Benchmark结果为CSV"""
+    rows = []
+
+    for algo_name, problems in benchmark_results['results'].items():
+        for prob_name, data in problems.items():
+            for repeat_data in data['repeats']:
+                row = {
+                    '算法': algo_name,
+                    '问题': prob_name,
+                    '重复次数': repeat_data['run_idx'] + 1,
+                    '随机种子': repeat_data['seed'],
+                    '运行时间(秒)': repeat_data.get('runtime', np.nan),
+                    '运行状态': '成功' if repeat_data['error'] is None else '失败',
+                    '错误信息': repeat_data['error'] if repeat_data['error'] else ''
+                }
+                for metric in selected_metrics:
+                    row[metric] = repeat_data['metrics'].get(metric, np.nan)
+                rows.append(row)
+
+    df = pd.DataFrame(rows)
+    return df.to_csv(index=False, encoding='utf-8-sig')
+
+
+def benchmark_tab():
+    """批量自动化Benchmark评测标签页"""
+    st.header("🏆 批量自动化Benchmark评测")
+    st.caption("配置算法和问题集合，自动运行所有组合并生成结构化评测报告")
+
+    left_col, right_col = st.columns([1, 2], gap="large")
+
+    with left_col:
+        _render_benchmark_config()
+
+    with right_col:
+        _render_benchmark_report()
+
+
+def _render_benchmark_config():
+    """渲染左侧评测配置区"""
+    st.subheader("⚙️ 评测配置")
+
+    all_problems_flat = []
+    for series, problems in PROBLEM_MAP.items():
+        all_problems_flat.extend(problems.keys())
+
+    st.markdown("**1. 算法集合（选择2~5个）**")
+    selected_algorithms = st.multiselect(
+        "选择待评测算法",
+        list(ALGORITHM_MAP.keys()),
+        default=[list(ALGORITHM_MAP.keys())[0], list(ALGORITHM_MAP.keys())[1]] if len(ALGORITHM_MAP) >= 2 else [],
+        key="benchmark_algos"
+    )
+
+    n_algos = len(selected_algorithms)
+    if n_algos < 2:
+        st.warning("⚠️ 请至少选择2个算法")
+    elif n_algos > 5:
+        st.warning("⚠️ 最多只能选择5个算法")
+
+    st.divider()
+    st.markdown("**2. 问题集合（选择2~10个，可跨系列）**")
+
+    problem_options = []
+    for series, problems in PROBLEM_MAP.items():
+        for prob in problems.keys():
+            problem_options.append(f"{series[:-2]} - {prob}")
+
+    selected_problem_labels = st.multiselect(
+        "选择测试函数",
+        problem_options,
+        default=["ZDT - ZDT1", "DTLZ - DTLZ2"],
+        key="benchmark_problems"
+    )
+
+    selected_problems = [label.split(" - ")[1] for label in selected_problem_labels]
+    n_problems = len(selected_problems)
+
+    if n_problems < 2:
+        st.warning("⚠️ 请至少选择2个测试函数")
+    elif n_problems > 10:
+        st.warning("⚠️ 最多只能选择10个测试函数")
+
+    st.divider()
+    st.markdown("**3. 统一运行参数**")
+
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        n_gen = st.number_input("最大代数", min_value=10, max_value=5000, value=200, step=10, key="benchmark_n_gen")
+    with col_p2:
+        pop_size = st.number_input("种群大小", min_value=10, max_value=1000, value=100, step=10, key="benchmark_pop_size")
+
+    col_p3, col_p4 = st.columns(2)
+    with col_p3:
+        n_repeats = st.number_input("重复运行次数", min_value=1, max_value=10, value=3, step=1, key="benchmark_n_repeats")
+    with col_p4:
+        seed_start = st.number_input("随机种子起始值", min_value=0, value=42, step=1, key="benchmark_seed_start")
+
+    if n_repeats < 1 or n_repeats > 10:
+        st.error("❌ 重复次数必须在1~10之间")
+
+    st.divider()
+    st.markdown("**4. 评测指标选择（至少选1个）**")
+
+    col_m1, col_m2, col_m3 = st.columns(3)
+    with col_m1:
+        select_igd = st.checkbox("IGD", value=True, key="benchmark_metric_igd")
+    with col_m2:
+        select_hv = st.checkbox("HV", value=True, key="benchmark_metric_hv")
+    with col_m3:
+        select_spacing = st.checkbox("Spacing", value=True, key="benchmark_metric_spacing")
+
+    selected_metrics = []
+    if select_igd:
+        selected_metrics.append('IGD')
+    if select_hv:
+        selected_metrics.append('HV')
+    if select_spacing:
+        selected_metrics.append('Spacing')
+
+    if len(selected_metrics) == 0:
+        st.warning("⚠️ 请至少选择1个评测指标")
+
+    st.divider()
+
+    total_combinations = n_algos * n_problems * n_repeats
+    st.info(f"📊 总组合数: {n_algos}算法 × {n_problems}问题 × {n_repeats}重复 = **{total_combinations}** 个组合")
+
+    can_start = (
+        2 <= n_algos <= 5 and
+        2 <= n_problems <= 10 and
+        1 <= n_repeats <= 10 and
+        len(selected_metrics) >= 1 and
+        not st.session_state.benchmark_running
+    )
+
+    col_run, col_stop = st.columns(2)
+    with col_run:
+        start_btn = st.button(
+            "🚀 启动批量评测",
+            type="primary",
+            use_container_width=True,
+            disabled=not can_start,
+            key="btn_benchmark_start"
+        )
+    with col_stop:
+        stop_btn = st.button(
+            "⏹️ 终止",
+            use_container_width=True,
+            disabled=not st.session_state.benchmark_running,
+            key="btn_benchmark_stop"
+        )
+
+    if start_btn and can_start:
+        if total_combinations > 100:
+            if not st.session_state.get('benchmark_confirm_dismissed', False):
+                confirm = st.warning(f"⚠️ 评测规模较大({total_combinations}个组合)，预计耗时较长，是否继续？")
+                col_y, col_n = st.columns(2)
+                with col_y:
+                    if st.button("✅ 确认继续", type="primary", use_container_width=True, key="btn_benchmark_confirm"):
+                        st.session_state.benchmark_confirm_dismissed = True
+                        _start_benchmark(selected_algorithms, selected_problems, selected_metrics,
+                                        n_gen, pop_size, n_repeats, seed_start, total_combinations)
+                with col_n:
+                    if st.button("❌ 取消", use_container_width=True, key="btn_benchmark_cancel"):
+                        st.session_state.benchmark_confirm_dismissed = False
+        else:
+            _start_benchmark(selected_algorithms, selected_problems, selected_metrics,
+                            n_gen, pop_size, n_repeats, seed_start, total_combinations)
+
+    if stop_btn and st.session_state.benchmark_running:
+        st.session_state.benchmark_running = False
+        st.warning("⚠️ 评测已终止")
+
+
+def _start_benchmark(selected_algorithms, selected_problems, selected_metrics,
+                     n_gen, pop_size, n_repeats, seed_start, total_combinations):
+    """启动批量评测"""
+    config = {
+        'algorithms': selected_algorithms,
+        'problems': selected_problems,
+        'metrics': selected_metrics,
+        'n_gen': n_gen,
+        'pop_size': pop_size,
+        'n_repeats': n_repeats,
+        'seed_start': seed_start,
+        'total_combinations': total_combinations
+    }
+
+    st.session_state.benchmark_config = config
+    st.session_state.benchmark_running = True
+    st.session_state.benchmark_progress = 0
+
+    results = {}
+    for algo in selected_algorithms:
+        results[algo] = {}
+        for prob in selected_problems:
+            results[algo][prob] = {
+                'repeats': [],
+                'stats': {},
+                'has_error': False
+            }
+
+    st.session_state.benchmark_results = {
+        'config': config,
+        'results': results,
+        'completed': 0,
+        'total': total_combinations,
+        'current_algo': None,
+        'current_problem': None,
+        'current_repeat': None,
+        'start_time': datetime.now(),
+        'end_time': None
+    }
+
+    _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics,
+                       n_gen, pop_size, n_repeats, seed_start)
+
+
+def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics,
+                        n_gen, pop_size, n_repeats, seed_start):
+    """运行评测主循环"""
+    try:
+        completed = 0
+
+        for problem_idx, problem_name in enumerate(selected_problems):
+            if not st.session_state.benchmark_running:
+                break
+
+            problem = _create_problem_by_name(problem_name)
+            if problem is None:
+                for algo_name in selected_algorithms:
+                    for run_idx in range(n_repeats):
+                        st.session_state.benchmark_results['results'][algo_name][problem_name]['repeats'].append({
+                            'run_idx': run_idx,
+                            'seed': seed_start + problem_idx * 100 + run_idx,
+                            'metrics': {},
+                            'final_population': None,
+                            'runtime': 0,
+                            'error': f"无法创建问题实例: {problem_name}"
+                        })
+                        st.session_state.benchmark_results['results'][algo_name][problem_name]['has_error'] = True
+                        completed += 1
+                        st.session_state.benchmark_results['completed'] = completed
+                        st.rerun()
+                continue
+
+            for algo_idx, algo_name in enumerate(selected_algorithms):
+                if not st.session_state.benchmark_running:
+                    break
+
+                st.session_state.benchmark_results['current_algo'] = algo_name
+                st.session_state.benchmark_results['current_problem'] = problem_name
+
+                repeats_data = []
+
+                for run_idx in range(n_repeats):
+                    if not st.session_state.benchmark_running:
+                        break
+
+                    st.session_state.benchmark_results['current_repeat'] = run_idx + 1
+                    st.rerun()
+
+                    seed = seed_start + problem_idx * 100 + algo_idx * 10 + run_idx
+
+                    repeat_result = {
+                        'run_idx': run_idx,
+                        'seed': seed,
+                        'metrics': {},
+                        'final_population': None,
+                        'runtime': 0,
+                        'error': None
+                    }
+
+                    try:
+                        algorithm = _create_algorithm_by_name(algo_name, pop_size, n_gen, seed)
+
+                        start_time = time.time()
+                        result = algorithm.run(problem, verbose=False)
+                        runtime = time.time() - start_time
+
+                        approx_front = result.pareto_front
+                        metrics = _compute_benchmark_metrics(approx_front, problem, selected_metrics)
+
+                        repeat_result['metrics'] = metrics
+                        repeat_result['final_population'] = approx_front
+                        repeat_result['runtime'] = runtime
+
+                        record = ExperimentRecord(
+                            algorithm_name=algo_name,
+                            problem_name=problem.name,
+                            params=algorithm.get_params(),
+                            metrics=metrics,
+                            runtime=runtime,
+                            result=result
+                        )
+                        st.session_state.experiment_history.add_record(record)
+
+                    except Exception as e:
+                        repeat_result['error'] = str(e)
+                        st.session_state.benchmark_results['results'][algo_name][problem_name]['has_error'] = True
+
+                    repeats_data.append(repeat_result)
+                    completed += 1
+                    st.session_state.benchmark_progress = completed / st.session_state.benchmark_results['total']
+                    st.session_state.benchmark_results['completed'] = completed
+
+                    st.session_state.benchmark_results['results'][algo_name][problem_name]['repeats'] = repeats_data
+                    st.session_state.benchmark_results['results'][algo_name][problem_name]['stats'] = \
+                        _compute_benchmark_stats(repeats_data, selected_metrics)
+
+                    st.rerun()
+
+        st.session_state.benchmark_running = False
+        st.session_state.benchmark_results['current_algo'] = None
+        st.session_state.benchmark_results['current_problem'] = None
+        st.session_state.benchmark_results['current_repeat'] = None
+        st.session_state.benchmark_results['end_time'] = datetime.now()
+        st.rerun()
+
+    except Exception as e:
+        st.session_state.benchmark_running = False
+        st.error(f"❌ 评测过程中发生错误: {e}")
+
+
+def _render_benchmark_report():
+    """渲染右侧报告展示区"""
+    benchmark_results = st.session_state.benchmark_results
+
+    if benchmark_results is None:
+        st.info("👈 请在左侧配置评测参数后点击\"启动批量评测\"")
+        return
+
+    config = benchmark_results['config']
+    selected_metrics = config['metrics']
+
+    if st.session_state.benchmark_running:
+        st.subheader("🔄 评测进行中...")
+
+        progress = st.session_state.benchmark_progress
+        progress_bar = st.progress(progress)
+        status_text = st.empty()
+
+        completed = benchmark_results['completed']
+        total = benchmark_results['total']
+        current_algo = benchmark_results['current_algo']
+        current_problem = benchmark_results['current_problem']
+        current_repeat = benchmark_results['current_repeat']
+
+        status_text.info(
+            f"📊 进度: {completed}/{total} 个组合 "
+            f"({progress * 100:.1f}%) | "
+            f"当前: {current_algo} + {current_problem} "
+            f"(重复 {current_repeat}/{config['n_repeats']})"
+        )
+
+    if benchmark_results['completed'] > 0:
+        st.subheader("📈 评测结果")
+
+        rankings, overall_ranking, overall_scores = _compute_benchmark_rankings(
+            benchmark_results, selected_metrics
+        )
+
+        for metric in selected_metrics:
+            st.markdown(f"### {metric} 汇总表")
+            metric_optim = "(越小越好)" if metric in ['IGD', 'Spacing'] else "(越大越好)"
+            st.caption(f"{metric} {metric_optim}")
+
+            algo_names = config['algorithms']
+            problem_names = config['problems']
+
+            table_data = []
+            best_values = {}
+
+            for problem in problem_names:
+                valid_values = []
+                for algo in algo_names:
+                    stats = benchmark_results['results'][algo][problem]['stats']
+                    if metric in stats and stats[metric]['count'] > 0:
+                        valid_values.append(stats[metric]['mean'])
+
+                if valid_values:
+                    if metric in ['IGD', 'Spacing']:
+                        best_values[problem] = min(valid_values)
+                    else:
+                        best_values[problem] = max(valid_values)
+
+            for algo in algo_names:
+                row = {'算法': algo}
+                for problem in problem_names:
+                    stats = benchmark_results['results'][algo][problem]['stats']
+                    if metric in stats and stats[metric]['count'] > 0:
+                        cell_value = _format_mean_std(stats[metric]['mean'], stats[metric]['std'])
+                    else:
+                        cell_value = "N/A"
+                    row[problem] = cell_value
+                table_data.append(row)
+
+            df = pd.DataFrame(table_data)
+
+            def highlight_best(row):
+                styles = [''] * len(row)
+                for i, problem in enumerate(problem_names):
+                    col_idx = i + 1
+                    stats = benchmark_results['results'][row['算法']][problem]['stats']
+                    if metric in stats and stats[metric]['count'] > 0:
+                        if abs(stats[metric]['mean'] - best_values.get(problem, float('inf'))) < 1e-10:
+                            styles[col_idx] = 'background-color: #90EE90; color: black;'
+                return styles
+
+            st.dataframe(
+                df.style.apply(highlight_best, axis=1),
+                use_container_width=True,
+                hide_index=True,
+                key=f"df_benchmark_{metric}"
+            )
+
+        st.markdown("### 🏆 综合排名")
+        ranking_data = []
+        for rank, (algo, score) in enumerate(overall_ranking):
+            ranking_data.append({
+                '排名': rank + 1,
+                '算法': algo,
+                '总分': score
+            })
+        ranking_df = pd.DataFrame(ranking_data)
+        st.dataframe(
+            ranking_df.style.format({'总分': '{:.0f}'}),
+            use_container_width=True,
+            hide_index=True,
+            key="df_benchmark_ranking"
+        )
+
+        st.divider()
+        st.markdown("### 📋 详细结果")
+
+        for algo in config['algorithms']:
+            for problem in config['problems']:
+                data = benchmark_results['results'][algo][problem]
+                has_error = data['has_error']
+                error_tag = " ❌" if has_error else ""
+
+                with st.expander(f"📊 {algo} + {problem}{error_tag}", expanded=False):
+                    if has_error:
+                        failed_runs = [r for r in data['repeats'] if r['error'] is not None]
+                        if failed_runs:
+                            st.error(f"❌ 存在运行错误: {failed_runs[0]['error']}")
+
+                    detail_rows = []
+                    for repeat_data in data['repeats']:
+                        row = {
+                            '重复': repeat_data['run_idx'] + 1,
+                            '种子': repeat_data['seed'],
+                            '运行时间(s)': f"{repeat_data['runtime']:.2f}",
+                            '状态': '✅ 成功' if repeat_data['error'] is None else f'❌ {repeat_data["error"]}'
+                        }
+                        for metric in selected_metrics:
+                            val = repeat_data['metrics'].get(metric, np.nan)
+                            row[metric] = f"{val:.4f}" if not np.isnan(val) else "N/A"
+                        detail_rows.append(row)
+
+                    if detail_rows:
+                        detail_df = pd.DataFrame(detail_rows)
+                        st.dataframe(detail_df, use_container_width=True, hide_index=True,
+                                     key=f"df_benchmark_detail_{algo}_{problem}")
+
+                    if data['stats']:
+                        st.markdown("**统计值:**")
+                        stats_cols = st.columns(len(selected_metrics))
+                        for i, metric in enumerate(selected_metrics):
+                            if metric in data['stats'] and data['stats'][metric]['count'] > 0:
+                                s = data['stats'][metric]
+                                with stats_cols[i]:
+                                    st.metric(
+                                        f"{metric}",
+                                        f"{s['mean']:.4f}",
+                                        f"±{s['std']:.4f}"
+                                    )
+
+                    last_pop = None
+                    for repeat_data in reversed(data['repeats']):
+                        if repeat_data['final_population'] is not None:
+                            last_pop = repeat_data['final_population']
+                            break
+
+                    if last_pop is not None:
+                        st.markdown("**目标空间散点图（最后一次重复结果）:**")
+                        problem_obj = _create_problem_by_name(problem)
+                        true_front = problem_obj.pareto_front() if problem_obj and problem_obj.pareto_front() is not None else None
+
+                        if last_pop.shape[1] == 2:
+                            fig = plot_pareto_front_2d(
+                                {'近似前沿': last_pop},
+                                true_front=true_front,
+                                title=f"{algo} + {problem} - 目标空间"
+                            )
+                            st.pyplot(fig, use_container_width=True)
+                        elif last_pop.shape[1] == 3:
+                            fig = plot_pareto_front_3d(
+                                {'近似前沿': last_pop},
+                                true_front=true_front,
+                                title=f"{algo} + {problem} - 目标空间"
+                            )
+                            st.pyplot(fig, use_container_width=True)
+                        else:
+                            fig = plot_parallel_coordinates(
+                                {'近似前沿': last_pop},
+                                title=f"{algo} + {problem} - 平行坐标图"
+                            )
+                            st.pyplot(fig, use_container_width=True)
+
+        st.divider()
+        col_dl1, col_dl2 = st.columns([1, 3])
+        with col_dl1:
+            csv_data = _export_benchmark_csv(benchmark_results, selected_metrics)
+            fname = f"benchmark_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            st.download_button(
+                "📥 导出完整报告",
+                csv_data,
+                fname,
+                "text/csv",
+                use_container_width=True,
+                key="btn_benchmark_export"
+            )
+        with col_dl2:
+            st.caption("CSV文件包含所有组合所有重复的原始指标数据、统计值和运行信息")
+
+
 def main():
     """主函数"""
     init_session_state()
@@ -2378,7 +3046,7 @@ def main():
     problem = sidebar_problem_config()
     sidebar_algorithm_config()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "📚 问题定义",
         "▶️ 运行优化",
         "📊 结果可视化",
@@ -2386,7 +3054,8 @@ def main():
         "🎯 决策支持",
         "📐 参数灵敏度分析",
         "📈 算法收敛性监控",
-        "📋 实验记录"
+        "📋 实验记录",
+        "🏆 批量Benchmark评测"
     ])
 
     with tab1:
@@ -2416,6 +3085,9 @@ def main():
 
     with tab8:
         history_tab()
+
+    with tab9:
+        benchmark_tab()
 
     st.divider()
     st.caption("帕累托前沿分析平台 v1.0 | 基于 Streamlit + NumPy + Matplotlib")
