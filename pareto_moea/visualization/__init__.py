@@ -10,6 +10,7 @@ from .plots import (
     plot_sensitivity_line,
     plot_convergence_metrics,
     plot_population_scatter,
+    plot_convergence_with_warnings,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "plot_sensitivity_line",
     "plot_convergence_metrics",
     "plot_population_scatter",
+    "plot_convergence_with_warnings",
 ]

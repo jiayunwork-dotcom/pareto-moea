@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import time
 import json
+import os
 from datetime import datetime
 
 from pareto_moea.problems import (
@@ -32,7 +33,8 @@ from pareto_moea.visualization import (
     plot_generation_animation,
     plot_sensitivity_line,
     plot_convergence_metrics,
-    plot_population_scatter
+    plot_population_scatter,
+    plot_convergence_with_warnings,
 )
 
 from pareto_moea.decision_making import (
@@ -137,6 +139,9 @@ def init_session_state():
 
     if 'monitor_selected_gen' not in st.session_state:
         st.session_state.monitor_selected_gen = 0
+
+    if 'monitor_template_loaded' not in st.session_state:
+        st.session_state.monitor_template_loaded = False
 
 
 def sidebar_problem_config():
@@ -1406,23 +1411,237 @@ def _compute_monitor_metrics(objectives, true_front, ref_point):
     return metrics
 
 
+def _detect_hv_stagnation(generations, hv_values, hv_threshold_pct=0.1, consec_gens=5):
+    """检测HV停滞
+
+    当连续consec_gens代HV变化率绝对值小于阈值时，返回停滞起始代数列表和预警信息
+
+    Args:
+        generations: 代数列表
+        hv_values: HV值列表
+        hv_threshold_pct: HV变化率阈值（百分比，如0.1表示0.1%）
+        consec_gens: 连续代数要求
+
+    Returns:
+        (stagnation_gens, warnings) - 停滞点代数列表，预警信息列表
+    """
+    stagnation_gens = []
+    warnings = []
+
+    if len(hv_values) < consec_gens + 1:
+        return stagnation_gens, warnings
+
+    hv_arr = np.asarray(hv_values, dtype=float)
+    gen_arr = np.asarray(generations, dtype=int)
+
+    i = 0
+    while i < len(hv_arr) - consec_gens:
+        all_stable = True
+        for j in range(consec_gens):
+            if np.isnan(hv_arr[i + j]) or np.isnan(hv_arr[i + j + 1]):
+                all_stable = False
+                break
+            if hv_arr[i + j] == 0:
+                change_rate = abs(hv_arr[i + j + 1] - hv_arr[i + j]) / 1e-10 * 100
+            else:
+                change_rate = abs(hv_arr[i + j + 1] - hv_arr[i + j]) / abs(hv_arr[i + j]) * 100
+            if change_rate >= hv_threshold_pct:
+                all_stable = False
+                break
+        if all_stable:
+            start_gen = gen_arr[i]
+            end_gen = gen_arr[i + consec_gens]
+            stagnation_gens.append(int(start_gen))
+            warnings.append({
+                'type': 'hv_stagnation',
+                'start_gen': int(start_gen),
+                'end_gen': int(end_gen),
+                'message': f"HV在第{start_gen}代~第{end_gen}代期间停滞,建议检查种群多样性"
+            })
+            i += consec_gens
+        else:
+            i += 1
+
+    return stagnation_gens, warnings
+
+
+def _detect_igd_rebound(generations, igd_values, igd_threshold_pct=5.0):
+    """检测IGD反弹
+
+    当相邻两个采样点IGD值上升且幅度超过阈值时，返回反弹代数列表和预警信息
+
+    Args:
+        generations: 代数列表
+        igd_values: IGD值列表
+        igd_threshold_pct: IGD反弹阈值（百分比，如5表示5%）
+
+    Returns:
+        (rebound_gens, warnings) - 反弹点代数列表，预警信息列表
+    """
+    rebound_gens = []
+    warnings = []
+
+    if len(igd_values) < 2:
+        return rebound_gens, warnings
+
+    igd_arr = np.asarray(igd_values, dtype=float)
+    gen_arr = np.asarray(generations, dtype=int)
+
+    for i in range(len(igd_arr) - 1):
+        prev = igd_arr[i]
+        curr = igd_arr[i + 1]
+        if np.isnan(prev) or np.isnan(curr):
+            continue
+        if curr > prev:
+            if prev == 0:
+                rebound_pct = (curr - prev) / 1e-10 * 100
+            else:
+                rebound_pct = (curr - prev) / prev * 100
+            if rebound_pct >= igd_threshold_pct:
+                rebound_gen = int(gen_arr[i + 1])
+                rebound_gens.append(rebound_gen)
+                warnings.append({
+                    'type': 'igd_rebound',
+                    'gen': rebound_gen,
+                    'rebound_pct': round(rebound_pct, 2),
+                    'message': f"IGD在第{rebound_gen}代出现反弹(+{rebound_pct:.2f}%),可能发生早熟收敛"
+                })
+
+    return rebound_gens, warnings
+
+
+def _find_hv_stable_generation(generations, hv_values, hv_threshold_pct=0.1, consec_gens=5):
+    """找到HV首次达到稳定的代数（首次连续consec_gens代HV变化率<阈值的起始代数）
+
+    Returns:
+        稳定起始代数，若全程未稳定返回None
+    """
+    if len(hv_values) < consec_gens + 1:
+        return None
+
+    hv_arr = np.asarray(hv_values, dtype=float)
+    gen_arr = np.asarray(generations, dtype=int)
+
+    for i in range(len(hv_arr) - consec_gens):
+        all_stable = True
+        for j in range(consec_gens):
+            if np.isnan(hv_arr[i + j]) or np.isnan(hv_arr[i + j + 1]):
+                all_stable = False
+                break
+            if hv_arr[i + j] == 0:
+                change_rate = abs(hv_arr[i + j + 1] - hv_arr[i + j]) / 1e-10 * 100
+            else:
+                change_rate = abs(hv_arr[i + j + 1] - hv_arr[i + j]) / abs(hv_arr[i + j]) * 100
+            if change_rate >= hv_threshold_pct:
+                all_stable = False
+                break
+        if all_stable:
+            return int(gen_arr[i])
+
+    return None
+
+
+TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
+
+
+def _ensure_templates_dir():
+    """确保templates目录存在"""
+    if not os.path.exists(TEMPLATES_DIR):
+        os.makedirs(TEMPLATES_DIR)
+
+
+def _list_templates():
+    """列出所有已保存的模板"""
+    _ensure_templates_dir()
+    if not os.path.exists(TEMPLATES_DIR):
+        return []
+    files = [f for f in os.listdir(TEMPLATES_DIR) if f.endswith('.json')]
+    return sorted(files)
+
+
+def _save_template(template_name, config):
+    """保存配置模板到JSON文件"""
+    _ensure_templates_dir()
+    if not template_name.endswith('.json'):
+        template_name += '.json'
+    filepath = os.path.join(TEMPLATES_DIR, template_name)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    return filepath
+
+
+def _load_template(template_name):
+    """从JSON文件加载配置模板"""
+    if not template_name.endswith('.json'):
+        template_name += '.json'
+    filepath = os.path.join(TEMPLATES_DIR, template_name)
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _validate_template(config):
+    """校验模板配置中的算法名和问题名是否存在
+
+    Returns:
+        (validated_config, errors, warnings)
+    """
+    errors = []
+    warnings_list = []
+
+    all_algorithms = list(ALGORITHM_MAP.keys())
+    all_problems_flat = []
+    for series in PROBLEM_MAP.values():
+        all_problems_flat.extend(series.keys())
+
+    validated_algorithms = []
+    invalid_algorithms = []
+    for algo_name in config.get('algorithms', []):
+        if algo_name in all_algorithms:
+            validated_algorithms.append(algo_name)
+        else:
+            invalid_algorithms.append(algo_name)
+            errors.append(f"算法 '{algo_name}' 不存在，已跳过")
+
+    if invalid_algorithms:
+        for a in invalid_algorithms:
+            errors.append(f"❌ 无效算法: {a}")
+
+    problem_name = config.get('problem_name')
+    problem_series = config.get('problem_series')
+    if problem_name and problem_series:
+        if problem_series not in PROBLEM_MAP:
+            errors.append(f"❌ 无效问题系列: {problem_series}")
+            config.pop('problem_series', None)
+            config.pop('problem_name', None)
+        elif problem_name not in PROBLEM_MAP[problem_series]:
+            errors.append(f"❌ 问题 '{problem_name}' 不存在于系列 '{problem_series}'，已跳过")
+            config.pop('problem_name', None)
+
+    config['algorithms'] = validated_algorithms
+    return config, errors, warnings_list
+
+
 def convergence_monitoring_tab():
     """算法收敛性动态监控标签页"""
     st.header("📈 算法收敛性动态监控")
-    st.caption("实时监控优化过程中IGD、HV、Spacing等收敛指标的变化趋势")
+    st.caption("实时监控优化过程中IGD、HV、Spacing等收敛指标的变化趋势 · 支持多算法对比 · 收敛预警 · 参数模板")
 
     left_col, right_col = st.columns([1, 2], gap="large")
 
     with left_col:
         st.subheader("⚙️ 运行配置")
 
-        mon_algo_name = st.selectbox(
-            "选择算法",
+        mon_algo_names = st.multiselect(
+            "选择算法（2~5个）",
             list(ALGORITHM_MAP.keys()),
-            key="mon_algo",
-            index=0
+            default=[list(ALGORITHM_MAP.keys())[0], list(ALGORITHM_MAP.keys())[1]] if len(ALGORITHM_MAP) >= 2 else list(ALGORITHM_MAP.keys())[:1],
+            key="mon_algos"
         )
-        algo_class = ALGORITHM_MAP[mon_algo_name]
+
+        if len(mon_algo_names) < 2:
+            st.warning("⚠️ 请至少选择2个算法进行对比")
+        elif len(mon_algo_names) > 5:
+            st.warning("⚠️ 最多只能选择5个算法")
 
         st.divider()
         st.markdown("**问题配置**")
@@ -1463,12 +1682,37 @@ def convergence_monitoring_tab():
         is_positive_int = (float(mon_sample_interval) > 0 and
                           float(mon_sample_interval) % 1 == 0)
         interval_valid = is_positive_int and mon_sample_interval <= max_allowed_interval
+        algos_valid = 2 <= len(mon_algo_names) <= 5
 
         if not interval_valid:
             st.warning(
                 f"⚠️ 采样间隔必须是正整数且不超过最大代数的一半 ({max_allowed_interval})，"
                 f"当前值 {mon_sample_interval} 无效"
             )
+
+        st.divider()
+        st.markdown("**收敛预警阈值**")
+
+        mon_hv_threshold = st.number_input(
+            "HV停滞阈值（%）",
+            min_value=0.001,
+            max_value=100.0,
+            value=0.1,
+            step=0.01,
+            format="%.3f",
+            key="mon_hv_threshold",
+            help="连续5代HV变化率绝对值小于此阈值时触发停滞警告"
+        )
+        mon_igd_threshold = st.number_input(
+            "IGD反弹阈值（%）",
+            min_value=0.1,
+            max_value=500.0,
+            value=5.0,
+            step=0.5,
+            format="%.1f",
+            key="mon_igd_threshold",
+            help="相邻采样点IGD上升幅度超过此阈值时触发反弹警告"
+        )
 
         st.divider()
 
@@ -1482,13 +1726,104 @@ def convergence_monitoring_tab():
 
         st.divider()
 
+        st.markdown("**参数模板**")
+        col_tpl1, col_tpl2 = st.columns(2)
+        with col_tpl1:
+            template_name_input = st.text_input("模板名称", value="", key="mon_tpl_name_input", placeholder="例如: zdt1_benchmark")
+            save_tpl_btn = st.button("💾 保存为模板", use_container_width=True, key="btn_save_tpl")
+        with col_tpl2:
+            available_templates = _list_templates()
+            template_options = ["-- 选择模板 --"] + available_templates
+            selected_template = st.selectbox("加载模板", template_options, key="mon_tpl_select")
+            load_tpl_btn = st.button("📂 加载模板", use_container_width=True, key="btn_load_tpl", disabled=(selected_template == "-- 选择模板 --"))
+
+        if save_tpl_btn:
+            if not template_name_input.strip():
+                st.error("⚠️ 请输入模板名称")
+            else:
+                tpl_config = {
+                    'algorithms': mon_algo_names,
+                    'problem_series': mon_series,
+                    'problem_name': mon_prob_name,
+                    'n_gen': mon_n_gen,
+                    'sample_interval': mon_sample_interval,
+                    'pop_size': mon_pop_size,
+                    'seed': mon_seed,
+                    'hv_threshold_pct': mon_hv_threshold,
+                    'igd_threshold_pct': mon_igd_threshold,
+                    'problem_params': {}
+                }
+                if mon_series == 'DTLZ系列':
+                    tpl_config['problem_params'] = {'n_obj': mon_n_obj, 'k': mon_k}
+                elif mon_series == 'WFG系列':
+                    tpl_config['problem_params'] = {'n_obj': mon_n_obj, 'k': mon_k}
+                else:
+                    tpl_config['problem_params'] = {'n_var': mon_n_var}
+
+                try:
+                    _save_template(template_name_input, tpl_config)
+                    st.success(f"✅ 模板已保存: {template_name_input}.json")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 保存失败: {e}")
+
+        if load_tpl_btn and selected_template != "-- 选择模板 --":
+            try:
+                tpl_config = _load_template(selected_template)
+                validated_config, errors, warnings_list = _validate_template(tpl_config)
+
+                if errors:
+                    for err in errors:
+                        st.error(err)
+
+                if 'algorithms' in validated_config and validated_config['algorithms']:
+                    st.session_state['mon_algos'] = validated_config['algorithms']
+                if 'problem_series' in validated_config:
+                    st.session_state['mon_series'] = validated_config['problem_series']
+                if 'problem_name' in validated_config:
+                    st.session_state['mon_prob'] = validated_config['problem_name']
+                if 'n_gen' in validated_config:
+                    st.session_state['mon_n_gen'] = validated_config['n_gen']
+                if 'sample_interval' in validated_config:
+                    st.session_state['mon_sample_interval'] = validated_config['sample_interval']
+                if 'pop_size' in validated_config:
+                    st.session_state['mon_pop_size'] = validated_config['pop_size']
+                if 'seed' in validated_config:
+                    st.session_state['mon_seed'] = validated_config['seed']
+                if 'hv_threshold_pct' in validated_config:
+                    st.session_state['mon_hv_threshold'] = validated_config['hv_threshold_pct']
+                if 'igd_threshold_pct' in validated_config:
+                    st.session_state['mon_igd_threshold'] = validated_config['igd_threshold_pct']
+
+                problem_params = validated_config.get('problem_params', {})
+                if mon_series == 'DTLZ系列':
+                    if 'n_obj' in problem_params:
+                        st.session_state['mon_dtlz_n_obj'] = problem_params['n_obj']
+                    if 'k' in problem_params:
+                        st.session_state['mon_dtlz_k'] = problem_params['k']
+                elif mon_series == 'WFG系列':
+                    if 'n_obj' in problem_params:
+                        st.session_state['mon_wfg_n_obj'] = problem_params['n_obj']
+                    if 'k' in problem_params:
+                        st.session_state['mon_wfg_k'] = problem_params['k']
+                else:
+                    if 'n_var' in problem_params:
+                        st.session_state['mon_zdt_n_var'] = problem_params['n_var']
+
+                st.success(f"✅ 模板已加载: {selected_template}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 加载失败: {e}")
+
+        st.divider()
+
         col_run, col_stop = st.columns(2)
         with col_run:
             start_monitor = st.button(
                 "🚀 启动监控运行",
                 type="primary",
                 use_container_width=True,
-                disabled=(st.session_state.monitor_running or not interval_valid),
+                disabled=(st.session_state.monitor_running or not interval_valid or not algos_valid),
                 key="btn_start_monitor"
             )
         with col_stop:
@@ -1503,126 +1838,178 @@ def convergence_monitoring_tab():
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        if start_monitor and not st.session_state.monitor_running and interval_valid:
+        if start_monitor and not st.session_state.monitor_running and interval_valid and algos_valid:
             st.session_state.monitor_running = True
             st.session_state.monitor_data = None
 
-            monitor_generations = []
-            monitor_igd = []
-            monitor_hv = []
-            monitor_spacing = []
-            monitor_populations = {}
+            multi_results = {}
+            total_algorithms = len(mon_algo_names)
 
-            algo = _create_monitor_algorithm(
-                mon_algo_name, algo_class, mon_pop_size, mon_n_gen, mon_seed
-            )
-
-            true_front_pf = mon_problem.pareto_front() if has_true_front else None
-
-            ref_point = None
-
-            def monitor_callback(algo_ref, gen, pop, obj, cv):
-                nonlocal ref_point
-
+            for algo_idx, mon_algo_name in enumerate(mon_algo_names):
                 if not st.session_state.monitor_running:
-                    algo_ref.stop()
-                    return
+                    break
 
-                if gen == 0 or gen % mon_sample_interval == 0 or gen == mon_n_gen:
-                    if ref_point is None:
-                        if true_front_pf is not None and len(true_front_pf) > 0:
-                            ref_point = np.maximum(
-                                np.max(obj, axis=0),
-                                np.max(true_front_pf, axis=0)
-                            ) * 1.1 + 1e-6
-                        else:
-                            ref_point = np.max(obj, axis=0) * 1.1 + 1e-6
+                algo_class = ALGORITHM_MAP[mon_algo_name]
+                status_text.info(f"🔄 正在运行算法 {algo_idx + 1}/{total_algorithms}: {mon_algo_name}")
 
-                    metrics = _compute_monitor_metrics(obj, true_front_pf, ref_point)
+                monitor_generations = []
+                monitor_igd = []
+                monitor_hv = []
+                monitor_spacing = []
+                monitor_populations = {}
 
-                    monitor_generations.append(gen)
-                    monitor_igd.append(metrics['IGD'])
-                    monitor_hv.append(metrics['HV'])
-                    monitor_spacing.append(metrics['Spacing'])
-                    monitor_populations[gen] = obj.copy()
+                algo = _create_monitor_algorithm(
+                    mon_algo_name, algo_class, mon_pop_size, mon_n_gen, mon_seed
+                )
 
-                    curr_progress = gen / max(1, mon_n_gen)
-                    progress_bar.progress(curr_progress)
-                    status_text.info(
-                        f"📊 监控运行中 - 第 {gen}/{mon_n_gen} 代 | "
-                        f"已采样 {len(monitor_generations)} 个点 | "
-                        f"HV: {metrics['HV']:.4f} | "
-                        f"Spacing: {metrics['Spacing']:.6f}"
-                        + (f" | IGD: {metrics['IGD']:.6f}" if has_true_front else "")
+                true_front_pf = mon_problem.pareto_front() if has_true_front else None
+
+                ref_point = None
+                runtime_start = time.time()
+
+                def make_monitor_callback(algo_idx_inner, total_algo_inner, algo_name_inner):
+                    def monitor_callback(algo_ref, gen, pop, obj, cv):
+                        nonlocal ref_point
+
+                        if not st.session_state.monitor_running:
+                            algo_ref.stop()
+                            return
+
+                        if gen == 0 or gen % mon_sample_interval == 0 or gen == mon_n_gen:
+                            if ref_point is None:
+                                if true_front_pf is not None and len(true_front_pf) > 0:
+                                    ref_point = np.maximum(
+                                        np.max(obj, axis=0),
+                                        np.max(true_front_pf, axis=0)
+                                    ) * 1.1 + 1e-6
+                                else:
+                                    ref_point = np.max(obj, axis=0) * 1.1 + 1e-6
+
+                            metrics = _compute_monitor_metrics(obj, true_front_pf, ref_point)
+
+                            monitor_generations.append(gen)
+                            monitor_igd.append(metrics['IGD'])
+                            monitor_hv.append(metrics['HV'])
+                            monitor_spacing.append(metrics['Spacing'])
+                            monitor_populations[gen] = obj.copy()
+
+                            algo_progress = algo_idx_inner / total_algo_inner
+                            gen_progress = (gen / max(1, mon_n_gen)) / total_algo_inner
+                            curr_progress = algo_progress + gen_progress
+                            progress_bar.progress(min(curr_progress, 1.0))
+                            status_text.info(
+                                f"📊 算法 {algo_idx_inner + 1}/{total_algo_inner} [{algo_name_inner}] - "
+                                f"第 {gen}/{mon_n_gen} 代 | "
+                                f"HV: {metrics['HV']:.4f} | "
+                                f"Spacing: {metrics['Spacing']:.6f}"
+                                + (f" | IGD: {metrics['IGD']:.6f}" if has_true_front else "")
+                            )
+                    return monitor_callback
+
+                algo.set_callback(make_monitor_callback(algo_idx, total_algorithms, mon_algo_name))
+
+                try:
+                    result = algo.run(mon_problem, verbose=False)
+                    runtime_total = time.time() - runtime_start
+
+                    if len(monitor_generations) == 0 or monitor_generations[-1] != mon_n_gen:
+                        if ref_point is None:
+                            if true_front_pf is not None and len(true_front_pf) > 0:
+                                ref_point = np.maximum(
+                                    np.max(result.final_objectives, axis=0),
+                                    np.max(true_front_pf, axis=0)
+                                ) * 1.1 + 1e-6
+                            else:
+                                ref_point = np.max(result.final_objectives, axis=0) * 1.1 + 1e-6
+
+                        final_metrics = _compute_monitor_metrics(
+                            result.final_objectives, true_front_pf, ref_point
+                        )
+                        monitor_generations.append(mon_n_gen)
+                        monitor_igd.append(final_metrics['IGD'])
+                        monitor_hv.append(final_metrics['HV'])
+                        monitor_spacing.append(final_metrics['Spacing'])
+                        monitor_populations[mon_n_gen] = result.final_objectives.copy()
+
+                    hv_stag_gens, hv_warnings = _detect_hv_stagnation(
+                        monitor_generations, monitor_hv,
+                        hv_threshold_pct=mon_hv_threshold, consec_gens=5
+                    )
+                    igd_reb_gens, igd_warnings = _detect_igd_rebound(
+                        monitor_generations, monitor_igd,
+                        igd_threshold_pct=mon_igd_threshold
                     )
 
-            algo.set_callback(monitor_callback)
-
-            try:
-                result = algo.run(mon_problem, verbose=False)
-
-                if len(monitor_generations) == 0 or monitor_generations[-1] != mon_n_gen:
-                    if ref_point is None:
-                        if true_front_pf is not None and len(true_front_pf) > 0:
-                            ref_point = np.maximum(
-                                np.max(result.final_objectives, axis=0),
-                                np.max(true_front_pf, axis=0)
-                            ) * 1.1 + 1e-6
-                        else:
-                            ref_point = np.max(result.final_objectives, axis=0) * 1.1 + 1e-6
-
-                    final_metrics = _compute_monitor_metrics(
-                        result.final_objectives, true_front_pf, ref_point
+                    stable_gen = _find_hv_stable_generation(
+                        monitor_generations, monitor_hv,
+                        hv_threshold_pct=mon_hv_threshold, consec_gens=5
                     )
-                    monitor_generations.append(mon_n_gen)
-                    monitor_igd.append(final_metrics['IGD'])
-                    monitor_hv.append(final_metrics['HV'])
-                    monitor_spacing.append(final_metrics['Spacing'])
-                    monitor_populations[mon_n_gen] = result.final_objectives.copy()
 
+                    multi_results[mon_algo_name] = {
+                        'algorithm': mon_algo_name,
+                        'problem': mon_problem.name,
+                        'n_gen': mon_n_gen,
+                        'pop_size': mon_pop_size,
+                        'sample_interval': mon_sample_interval,
+                        'seed': mon_seed,
+                        'generations': monitor_generations,
+                        'igd': monitor_igd,
+                        'hv': monitor_hv,
+                        'spacing': monitor_spacing,
+                        'populations': monitor_populations,
+                        'true_front': true_front_pf,
+                        'has_true_front': has_true_front,
+                        'problem_obj': mon_problem,
+                        'n_obj': mon_problem.n_obj,
+                        'runtime': runtime_total,
+                        'hv_stagnation_gens': hv_stag_gens,
+                        'hv_warnings': hv_warnings,
+                        'igd_rebound_gens': igd_reb_gens,
+                        'igd_warnings': igd_warnings,
+                        'hv_stable_generation': stable_gen,
+                        'final_hv': monitor_hv[-1] if len(monitor_hv) > 0 else np.nan,
+                        'final_igd': monitor_igd[-1] if len(monitor_igd) > 0 and has_true_front else np.nan,
+                        'final_spacing': monitor_spacing[-1] if len(monitor_spacing) > 0 else np.nan,
+                    }
+
+                    record = ExperimentRecord(
+                        algorithm_name=mon_algo_name,
+                        problem_name=mon_problem.name,
+                        params=algo.get_params(),
+                        metrics={
+                            'IGD': monitor_igd[-1] if has_true_front and len(monitor_igd) > 0 else np.nan,
+                            'HV': monitor_hv[-1] if len(monitor_hv) > 0 else np.nan,
+                            'Spacing': monitor_spacing[-1] if len(monitor_spacing) > 0 else np.nan
+                        },
+                        runtime=runtime_total,
+                        result=result
+                    )
+                    st.session_state.experiment_history.add_record(record)
+
+                except Exception as e:
+                    st.session_state.monitor_running = False
+                    progress_bar.progress(0)
+                    status_text.error(f"❌ 算法 {mon_algo_name} 运行出错: {e}")
+                    import traceback
+                    st.error(traceback.format_exc())
+                    break
+
+            if st.session_state.monitor_running:
                 st.session_state.monitor_data = {
-                    'algorithm': mon_algo_name,
+                    'algorithms': mon_algo_names,
+                    'multi_results': multi_results,
                     'problem': mon_problem.name,
-                    'n_gen': mon_n_gen,
-                    'pop_size': mon_pop_size,
-                    'sample_interval': mon_sample_interval,
-                    'seed': mon_seed,
-                    'generations': monitor_generations,
-                    'igd': monitor_igd,
-                    'hv': monitor_hv,
-                    'spacing': monitor_spacing,
-                    'populations': monitor_populations,
-                    'true_front': true_front_pf,
-                    'has_true_front': has_true_front,
                     'problem_obj': mon_problem,
-                    'n_obj': mon_problem.n_obj
+                    'n_obj': mon_problem.n_obj,
+                    'has_true_front': has_true_front,
+                    'hv_threshold_pct': mon_hv_threshold,
+                    'igd_threshold_pct': mon_igd_threshold,
                 }
 
                 progress_bar.progress(1.0)
-                status_text.success("✅ 监控运行完成！")
+                status_text.success(f"✅ 所有 {len(mon_algo_names)} 个算法监控运行完成！")
                 st.session_state.monitor_running = False
-
-                record = ExperimentRecord(
-                    algorithm_name=mon_algo_name,
-                    problem_name=mon_problem.name,
-                    params=algo.get_params(),
-                    metrics={
-                        'IGD': monitor_igd[-1] if has_true_front else np.nan,
-                        'HV': monitor_hv[-1],
-                        'Spacing': monitor_spacing[-1]
-                    },
-                    runtime=result.runtime,
-                    result=result
-                )
-                st.session_state.experiment_history.add_record(record)
                 st.rerun()
-
-            except Exception as e:
-                st.session_state.monitor_running = False
-                progress_bar.progress(0)
-                status_text.error(f"❌ 运行出错: {e}")
-                import traceback
-                st.error(traceback.format_exc())
 
         if stop_monitor and st.session_state.monitor_running:
             st.session_state.monitor_running = False
@@ -1634,35 +2021,84 @@ def convergence_monitoring_tab():
             return
 
         mon_data = st.session_state.monitor_data
+        multi_results = mon_data['multi_results']
+        algo_names = mon_data['algorithms']
 
-        metrics_data = {}
-        if mon_data['has_true_front']:
-            metrics_data['IGD'] = mon_data['igd']
-        metrics_data['HV'] = mon_data['hv']
-        metrics_data['Spacing'] = mon_data['spacing']
+        all_warnings = []
+        for an in algo_names:
+            res = multi_results[an]
+            for w in res.get('hv_warnings', []):
+                all_warnings.append((an, w))
+            for w in res.get('igd_warnings', []):
+                all_warnings.append((an, w))
 
-        colors = {
-            'IGD': '#d62728',
-            'HV': '#2ca02c',
-            'Spacing': '#ff7f0e'
-        }
+        if all_warnings:
+            st.subheader("⚠️ 收敛预警")
+            for algo_n, w in all_warnings:
+                if w['type'] == 'hv_stagnation':
+                    st.warning(f"**{algo_n}**: {w['message']}")
+                elif w['type'] == 'igd_rebound':
+                    st.error(f"**{algo_n}**: {w['message']}")
 
-        st.subheader("📊 收敛指标变化曲线")
-        fig_metrics = plot_convergence_metrics(
-            mon_data['generations'],
-            metrics_data,
-            title=f"{mon_data['algorithm']} on {mon_data['problem']} - 收敛指标",
+        st.subheader("📊 收敛指标对比曲线")
+
+        hv_data = {}
+        igd_data = {}
+        spacing_data = {}
+        hv_stag_points = {}
+        igd_reb_points = {}
+
+        for an in algo_names:
+            res = multi_results[an]
+            hv_data[an] = res['hv']
+            spacing_data[an] = res['spacing']
+            if res['has_true_front']:
+                igd_data[an] = res['igd']
+            hv_stag_points[an] = res['hv_stagnation_gens']
+            igd_reb_points[an] = res['igd_rebound_gens']
+
+        gens = multi_results[algo_names[0]]['generations']
+
+        fig_hv = plot_convergence_with_warnings(
+            hv_data,
+            metric_name="HV (Hypervolume)",
+            title="HV 收敛曲线对比 (越大越好)",
             xlabel="代数 (Generation)",
-            figsize=(10, 6),
-            colors=colors
+            ylabel="HV 值",
+            figsize=(10, 5),
+            hv_stagnation_points=hv_stag_points,
+            start_gen=0
         )
-        st.pyplot(fig_metrics, use_container_width=True)
+        st.pyplot(fig_hv, use_container_width=True)
+
+        fig_spacing = plot_convergence_with_warnings(
+            spacing_data,
+            metric_name="Spacing",
+            title="Spacing 收敛曲线对比 (越小越好)",
+            xlabel="代数 (Generation)",
+            ylabel="Spacing 值",
+            figsize=(10, 5),
+            start_gen=0
+        )
+        st.pyplot(fig_spacing, use_container_width=True)
+
+        if mon_data['has_true_front'] and igd_data:
+            fig_igd = plot_convergence_with_warnings(
+                igd_data,
+                metric_name="IGD (Inverted Generational Distance)",
+                title="IGD 收敛曲线对比 (越小越好)",
+                xlabel="代数 (Generation)",
+                ylabel="IGD 值",
+                figsize=(10, 5),
+                igd_rebound_points=igd_reb_points,
+                start_gen=0
+            )
+            st.pyplot(fig_igd, use_container_width=True)
 
         st.divider()
 
-        st.subheader("🎯 目标空间种群分布")
+        st.subheader("🎯 目标空间种群分布对比（多列布局）")
 
-        gens = mon_data['generations']
         if len(gens) > 0:
             gen_labels = [f"第 {g} 代" for g in gens]
 
@@ -1679,76 +2115,115 @@ def convergence_monitoring_tab():
                 st.info(f"当前: {gen_labels[selected_idx]}")
 
             selected_gen = gens[selected_idx]
-            current_pop = mon_data['populations'][selected_gen]
-            true_front_pf = mon_data.get('true_front')
 
-            fig_scatter = plot_population_scatter(
-                current_pop,
-                true_front=true_front_pf,
-                title=f"第 {selected_gen} 代种群分布 - {mon_data['algorithm']} on {mon_data['problem']}",
-                figsize=(9, 7),
-                point_color='#1f77b4',
-                true_front_color='#d62728'
-            )
-            st.pyplot(fig_scatter, use_container_width=True)
+            n_algos = len(algo_names)
+            scatter_cols = st.columns(n_algos)
 
-            pop_metrics = {
-                '代数': selected_gen,
-                '种群大小': len(current_pop)
-            }
-            if mon_data['has_true_front']:
-                pop_metrics['IGD'] = f"{mon_data['igd'][selected_idx]:.6f}"
-            pop_metrics['HV'] = f"{mon_data['hv'][selected_idx]:.6f}"
-            pop_metrics['Spacing'] = f"{mon_data['spacing'][selected_idx]:.6f}"
+            for i, an in enumerate(algo_names):
+                res = multi_results[an]
+                with scatter_cols[i]:
+                    st.markdown(f"**{an}**")
+                    current_pop = res['populations'].get(selected_gen)
+                    true_front_pf = res.get('true_front')
 
-            st.caption("当前代数指标: " + " | ".join([f"{k}: {v}" for k, v in pop_metrics.items()]))
+                    if current_pop is not None:
+                        fig_scatter = plot_population_scatter(
+                            current_pop,
+                            true_front=true_front_pf,
+                            title=f"第 {selected_gen} 代",
+                            figsize=(6, 5),
+                            point_color='#1f77b4',
+                            true_front_color='#d62728'
+                        )
+                        st.pyplot(fig_scatter, use_container_width=True)
+
+                        pop_metrics = {}
+                        if res['has_true_front'] and len(res['igd']) > selected_idx:
+                            pop_metrics['IGD'] = f"{res['igd'][selected_idx]:.6f}"
+                        if len(res['hv']) > selected_idx:
+                            pop_metrics['HV'] = f"{res['hv'][selected_idx]:.6f}"
+                        if len(res['spacing']) > selected_idx:
+                            pop_metrics['Spacing'] = f"{res['spacing'][selected_idx]:.6f}"
+
+                        st.caption(" | ".join([f"{k}: {v}" for k, v in pop_metrics.items()]))
+                    else:
+                        st.info("无数据")
 
         st.divider()
 
-        st.subheader("📋 收敛数据表格")
-        df_data = {
-            '代数': mon_data['generations'],
-            'HV': mon_data['hv'],
-            'Spacing': mon_data['spacing']
-        }
-        if mon_data['has_true_front']:
-            df_data['IGD'] = mon_data['igd']
+        st.subheader("📈 收敛速度对比表")
 
-        df_monitor = pd.DataFrame(df_data)
+        speed_rows = []
+        for an in algo_names:
+            res = multi_results[an]
+            stable_gen = res.get('hv_stable_generation')
+            speed_rows.append({
+                '算法名': an,
+                '达到HV稳定的代数': stable_gen if stable_gen is not None else '未收敛',
+                '最终HV值': res.get('final_hv', np.nan),
+                '最终IGD值': res.get('final_igd', np.nan),
+                '最终Spacing值': res.get('final_spacing', np.nan),
+                '总耗时(秒)': round(res.get('runtime', 0.0), 3),
+            })
 
-        if mon_data['has_true_front']:
-            display_cols = ['代数', 'IGD', 'HV', 'Spacing']
-        else:
-            display_cols = ['代数', 'HV', 'Spacing']
+        df_speed = pd.DataFrame(speed_rows)
 
-        format_dict = {}
-        for col in display_cols:
-            if col != '代数':
-                format_dict[col] = '{:.6f}'
+        speed_format_cols = ['最终HV值', '最终IGD值', '最终Spacing值', '总耗时(秒)']
+        speed_format_dict = {}
+        for col in speed_format_cols:
+            speed_format_dict[col] = '{:.6f}'
 
         st.dataframe(
-            df_monitor[display_cols].style.format(format_dict),
+            df_speed.style.format(speed_format_dict),
             use_container_width=True,
             hide_index=True,
-            key="df_monitor_data"
+            key="df_speed_comparison"
         )
 
         st.divider()
 
-        col_dl1, col_dl2 = st.columns([1, 3])
-        with col_dl1:
-            csv_data = df_monitor[display_cols].to_csv(index=False, encoding='utf-8-sig')
-            fname = f"convergence_{mon_data['algorithm']}_{mon_data['problem']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            st.download_button(
-                "📥 导出为 CSV",
-                csv_data,
-                fname,
-                "text/csv",
-                use_container_width=True,
-                key="btn_monitor_download"
-            )
-        with col_dl2:
-            st.caption("CSV 文件包含各采样代数的 IGD（如有）、HV、Spacing 指标值")
+        st.subheader("📋 收敛数据表格")
+
+        for an in algo_names:
+            res = multi_results[an]
+            with st.expander(f"📊 {an} - 详细数据"):
+                df_data = {
+                    '代数': res['generations'],
+                    'HV': res['hv'],
+                    'Spacing': res['spacing']
+                }
+                if res['has_true_front']:
+                    df_data['IGD'] = res['igd']
+
+                df_monitor = pd.DataFrame(df_data)
+
+                if res['has_true_front']:
+                    display_cols = ['代数', 'IGD', 'HV', 'Spacing']
+                else:
+                    display_cols = ['代数', 'HV', 'Spacing']
+
+                format_dict = {}
+                for col in display_cols:
+                    if col != '代数':
+                        format_dict[col] = '{:.6f}'
+
+                st.dataframe(
+                    df_monitor[display_cols].style.format(format_dict),
+                    use_container_width=True,
+                    hide_index=True,
+                    key=f"df_monitor_data_{an}"
+                )
+
+                csv_data = df_monitor[display_cols].to_csv(index=False, encoding='utf-8-sig')
+                fname = f"convergence_{an}_{res['problem']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                st.download_button(
+                    "📥 导出为 CSV",
+                    csv_data,
+                    fname,
+                    "text/csv",
+                    use_container_width=True,
+                    key=f"btn_monitor_download_{an}"
+                )
 
 
 def history_tab():

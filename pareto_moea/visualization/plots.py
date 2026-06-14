@@ -1245,3 +1245,139 @@ def plot_population_scatter(
     ax.legend(loc='best', fontsize=10)
     fig.tight_layout()
     return fig
+
+
+def plot_convergence_with_warnings(
+    convergence_data: Union[np.ndarray, List[np.ndarray], Dict[str, np.ndarray]],
+    metric_name: str = "Metric Value",
+    labels: Optional[List[str]] = None,
+    title: str = "Convergence Curve",
+    xlabel: str = "Generation",
+    ylabel: Optional[str] = None,
+    figsize: Tuple[float, float] = (8, 6),
+    colors: Optional[List[str]] = None,
+    linestyles: Optional[List[str]] = None,
+    show_legend: bool = True,
+    show_grid: bool = True,
+    log_scale: bool = False,
+    start_gen: int = 0,
+    hv_stagnation_points: Optional[Dict[str, List[int]]] = None,
+    igd_rebound_points: Optional[Dict[str, List[int]]] = None,
+) -> Figure:
+    """带预警标记的收敛曲线图
+
+    支持多算法同图对比，可叠加HV停滞（黄色三角）和IGD反弹（红色圆点）标记。
+
+    Args:
+        convergence_data: 收敛数据。可以是单个ndarray、列表或字典
+        metric_name: 指标名称
+        labels: 算法标签列表
+        title: 图表标题
+        xlabel: x轴标签
+        ylabel: y轴标签
+        figsize: 图表尺寸
+        colors: 颜色列表
+        linestyles: 线条样式列表
+        show_legend: 是否显示图例
+        show_grid: 是否显示网格
+        log_scale: y轴是否使用对数刻度
+        start_gen: 起始代数
+        hv_stagnation_points: HV停滞警告点，键为算法名，值为代数索引列表
+        igd_rebound_points: IGD反弹警告点，键为算法名，值为代数索引列表
+
+    Returns:
+        matplotlib Figure 对象
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+
+    default_colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    default_linestyles = ["-", "--", "-.", ":", "-", "--", "-.", ":", "-", "--"]
+
+    if colors is None:
+        colors = default_colors
+    if linestyles is None:
+        linestyles = default_linestyles
+
+    data_list = []
+    names_list = []
+
+    if isinstance(convergence_data, dict):
+        for name, data in convergence_data.items():
+            data = np.asarray(data, dtype=float)
+            data_list.append(data)
+            names_list.append(name)
+    elif isinstance(convergence_data, list):
+        for i, data in enumerate(convergence_data):
+            data = np.asarray(data, dtype=float)
+            data_list.append(data)
+            if labels is not None and i < len(labels):
+                names_list.append(labels[i])
+            else:
+                names_list.append(f"Algorithm {i + 1}")
+    else:
+        data = np.asarray(convergence_data, dtype=float)
+        data_list.append(data)
+        if labels is not None and len(labels) > 0:
+            names_list.append(labels[0])
+        else:
+            names_list.append("Algorithm")
+
+    if ylabel is None:
+        ylabel = metric_name
+
+    for i, data in enumerate(data_list):
+        color = colors[i % len(colors)]
+        linestyle = linestyles[i % len(linestyles)]
+        label = names_list[i] if i < len(names_list) else f"Algorithm {i + 1}"
+
+        n_gen = len(data)
+        gens = np.arange(start_gen, start_gen + n_gen)
+
+        ax.plot(
+            gens,
+            data,
+            color=color,
+            linestyle=linestyle,
+            linewidth=2,
+            label=label
+        )
+
+        if hv_stagnation_points and label in hv_stagnation_points:
+            stag_gens = hv_stagnation_points[label]
+            stag_values = [data[g - start_gen] for g in stag_gens if g - start_gen < len(data)]
+            stag_x = [g for g in stag_gens if g - start_gen < len(data)]
+            if stag_x:
+                ax.scatter(
+                    stag_x, stag_values,
+                    marker='^', c='#f0ad4e', s=150, zorder=10,
+                    label='HV停滞' if i == 0 else "",
+                    edgecolors='black', linewidths=0.5
+                )
+
+        if igd_rebound_points and label in igd_rebound_points:
+            reb_gens = igd_rebound_points[label]
+            reb_values = [data[g - start_gen] for g in reb_gens if g - start_gen < len(data)]
+            reb_x = [g for g in reb_gens if g - start_gen < len(data)]
+            if reb_x:
+                ax.scatter(
+                    reb_x, reb_values,
+                    marker='o', c='#d9534f', s=150, zorder=10,
+                    label='IGD反弹' if i == 0 else "",
+                    edgecolors='black', linewidths=0.5
+                )
+
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+
+    if log_scale:
+        ax.set_yscale("log")
+
+    if show_grid:
+        ax.grid(True, alpha=0.3)
+
+    if show_legend:
+        ax.legend(loc="best", fontsize=10)
+
+    fig.tight_layout()
+    return fig
