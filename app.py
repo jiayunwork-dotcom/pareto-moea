@@ -156,6 +156,9 @@ def init_session_state():
     if 'benchmark_progress' not in st.session_state:
         st.session_state.benchmark_progress = 0
 
+    if 'benchmark_pending_start' not in st.session_state:
+        st.session_state.benchmark_pending_start = None
+
     if 'benchmark_history' not in st.session_state:
         st.session_state.benchmark_history = []
 
@@ -2863,19 +2866,51 @@ def _render_benchmark_config():
             key="btn_benchmark_stop"
         )
 
-    if start_btn and can_start:
+    pending = st.session_state.benchmark_pending_start
+
+    if pending is not None:
+        st.warning(
+            f"⚠️ 评测规模较大({pending['total_combinations']}个组合)，"
+            "预计耗时较长，是否继续？"
+        )
+        col_y, col_n = st.columns(2)
+        with col_y:
+            confirm_btn = st.button(
+                "✅ 确认继续",
+                type="primary",
+                use_container_width=True,
+                key="btn_benchmark_confirm"
+            )
+        with col_n:
+            cancel_btn = st.button(
+                "❌ 取消",
+                use_container_width=True,
+                key="btn_benchmark_cancel"
+            )
+        if confirm_btn:
+            st.session_state.benchmark_pending_start = None
+            _start_benchmark(
+                pending['algorithms'], pending['problems'], pending['metrics'],
+                pending['n_gen'], pending['pop_size'], pending['n_repeats'],
+                pending['seed_start'], pending['total_combinations']
+            )
+        if cancel_btn:
+            st.session_state.benchmark_pending_start = None
+            st.rerun()
+
+    if start_btn and can_start and pending is None:
         if total_combinations > 100:
-            if not st.session_state.get('benchmark_confirm_dismissed', False):
-                confirm = st.warning(f"⚠️ 评测规模较大({total_combinations}个组合)，预计耗时较长，是否继续？")
-                col_y, col_n = st.columns(2)
-                with col_y:
-                    if st.button("✅ 确认继续", type="primary", use_container_width=True, key="btn_benchmark_confirm"):
-                        st.session_state.benchmark_confirm_dismissed = True
-                        _start_benchmark(selected_algorithms, selected_problems, selected_metrics,
-                                        n_gen, pop_size, n_repeats, seed_start, total_combinations)
-                with col_n:
-                    if st.button("❌ 取消", use_container_width=True, key="btn_benchmark_cancel"):
-                        st.session_state.benchmark_confirm_dismissed = False
+            st.session_state.benchmark_pending_start = {
+                'algorithms': selected_algorithms,
+                'problems': selected_problems,
+                'metrics': selected_metrics,
+                'n_gen': n_gen,
+                'pop_size': pop_size,
+                'n_repeats': n_repeats,
+                'seed_start': seed_start,
+                'total_combinations': total_combinations
+            }
+            st.rerun()
         else:
             _start_benchmark(selected_algorithms, selected_problems, selected_metrics,
                             n_gen, pop_size, n_repeats, seed_start, total_combinations)
@@ -2931,9 +2966,12 @@ def _start_benchmark(selected_algorithms, selected_problems, selected_metrics,
 
 def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics,
                         n_gen, pop_size, n_repeats, seed_start):
-    """运行评测主循环"""
+    """运行评测主循环（在单次脚本执行内完成，避免st.rerun()中断执行）"""
     try:
         completed = 0
+        total = st.session_state.benchmark_results['total']
+        progress_placeholder = st.empty()
+        status_placeholder = st.empty()
 
         for problem_idx, problem_name in enumerate(selected_problems):
             if not st.session_state.benchmark_running:
@@ -2954,7 +2992,6 @@ def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics
                         st.session_state.benchmark_results['results'][algo_name][problem_name]['has_error'] = True
                         completed += 1
                         st.session_state.benchmark_results['completed'] = completed
-                        st.rerun()
                 continue
 
             for algo_idx, algo_name in enumerate(selected_algorithms):
@@ -2971,7 +3008,6 @@ def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics
                         break
 
                     st.session_state.benchmark_results['current_repeat'] = run_idx + 1
-                    st.rerun()
 
                     seed = seed_start + problem_idx * 100 + algo_idx * 10 + run_idx
 
@@ -3014,14 +3050,18 @@ def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics
 
                     repeats_data.append(repeat_result)
                     completed += 1
-                    st.session_state.benchmark_progress = completed / st.session_state.benchmark_results['total']
+                    st.session_state.benchmark_progress = completed / total
                     st.session_state.benchmark_results['completed'] = completed
 
                     st.session_state.benchmark_results['results'][algo_name][problem_name]['repeats'] = repeats_data
                     st.session_state.benchmark_results['results'][algo_name][problem_name]['stats'] = \
                         _compute_benchmark_stats(repeats_data, selected_metrics)
 
-                    st.rerun()
+                    progress_placeholder.progress(completed / total)
+                    status_placeholder.info(
+                        f"📊 进度: {completed}/{total} 个组合 | "
+                        f"当前: {algo_name} + {problem_name} (重复 {run_idx + 1}/{n_repeats})"
+                    )
 
         st.session_state.benchmark_running = False
         st.session_state.benchmark_results['current_algo'] = None
@@ -3029,6 +3069,8 @@ def _run_benchmark_loop(selected_algorithms, selected_problems, selected_metrics
         st.session_state.benchmark_results['current_repeat'] = None
         st.session_state.benchmark_results['end_time'] = datetime.now()
         _save_benchmark_to_history()
+        progress_placeholder.empty()
+        status_placeholder.empty()
         st.rerun()
 
     except Exception as e:
@@ -3096,33 +3138,44 @@ def _render_benchmark_report():
             except Exception:
                 pass
 
-    if display_benchmark_results is None:
+    is_running_now = (not is_history_view) and st.session_state.benchmark_running
+
+    if display_benchmark_results is None and not is_running_now:
         st.info("👈 请在左侧配置评测参数后点击\"启动批量评测\"")
         return
+
+    if is_running_now:
+        display_benchmark_results = st.session_state.benchmark_results
+        if display_benchmark_results is None:
+            st.info("⏳ 正在初始化评测...请稍候")
+            return
+        display_config = display_benchmark_results['config']
 
     if display_config is None:
         return
     selected_metrics = display_config['metrics']
 
-    if st.session_state.benchmark_running and not is_history_view:
+    if is_running_now:
         st.subheader("🔄 评测进行中...")
-
+        st.info(
+            "评测正在后台执行，请等待完成。完成后将自动刷新页面展示完整结果。"
+        )
         progress = st.session_state.benchmark_progress
-        progress_bar = st.progress(progress)
-        status_text = st.empty()
-
-        completed = display_benchmark_results['completed']
-        total = display_benchmark_results['total']
-        current_algo = display_benchmark_results['current_algo']
-        current_problem = display_benchmark_results['current_problem']
-        current_repeat = display_benchmark_results['current_repeat']
-
-        status_text.info(
+        st.progress(progress)
+        completed = display_benchmark_results.get('completed', 0)
+        total = display_benchmark_results.get('total', 0)
+        current_algo = display_benchmark_results.get('current_algo')
+        current_problem = display_benchmark_results.get('current_problem')
+        current_repeat = display_benchmark_results.get('current_repeat')
+        n_repeats = display_config.get('n_repeats', '?')
+        st.caption(
             f"📊 进度: {completed}/{total} 个组合 "
             f"({progress * 100:.1f}%) | "
             f"当前: {current_algo} + {current_problem} "
-            f"(重复 {current_repeat}/{display_config['n_repeats']})"
+            f"(重复 {current_repeat}/{n_repeats})"
         )
+        if completed == 0:
+            return
 
     if display_benchmark_results['completed'] > 0:
         st.subheader("📈 评测结果")
