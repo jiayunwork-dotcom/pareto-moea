@@ -1987,29 +1987,67 @@ def convergence_monitoring_tab():
                     st.session_state.experiment_history.add_record(record)
 
                 except Exception as e:
-                    st.session_state.monitor_running = False
-                    progress_bar.progress(0)
-                    status_text.error(f"❌ 算法 {mon_algo_name} 运行出错: {e}")
+                    runtime_total = time.time() - runtime_start
                     import traceback
-                    st.error(traceback.format_exc())
-                    break
+                    error_detail = traceback.format_exc()
 
-            if st.session_state.monitor_running:
-                st.session_state.monitor_data = {
-                    'algorithms': mon_algo_names,
-                    'multi_results': multi_results,
-                    'problem': mon_problem.name,
-                    'problem_obj': mon_problem,
-                    'n_obj': mon_problem.n_obj,
-                    'has_true_front': has_true_front,
-                    'hv_threshold_pct': mon_hv_threshold,
-                    'igd_threshold_pct': mon_igd_threshold,
-                }
+                    multi_results[mon_algo_name] = {
+                        'algorithm': mon_algo_name,
+                        'problem': mon_problem.name,
+                        'n_gen': mon_n_gen,
+                        'pop_size': mon_pop_size,
+                        'sample_interval': mon_sample_interval,
+                        'seed': mon_seed,
+                        'generations': list(monitor_generations),
+                        'igd': list(monitor_igd),
+                        'hv': list(monitor_hv),
+                        'spacing': list(monitor_spacing),
+                        'populations': dict(monitor_populations),
+                        'true_front': true_front_pf,
+                        'has_true_front': has_true_front,
+                        'problem_obj': mon_problem,
+                        'n_obj': mon_problem.n_obj,
+                        'runtime': runtime_total,
+                        'hv_stagnation_gens': [],
+                        'hv_warnings': [],
+                        'igd_rebound_gens': [],
+                        'igd_warnings': [],
+                        'hv_stable_generation': None,
+                        'final_hv': monitor_hv[-1] if len(monitor_hv) > 0 else np.nan,
+                        'final_igd': monitor_igd[-1] if len(monitor_igd) > 0 and has_true_front else np.nan,
+                        'final_spacing': monitor_spacing[-1] if len(monitor_spacing) > 0 else np.nan,
+                        'failed': True,
+                        'error_message': str(e),
+                        'error_detail': error_detail,
+                    }
 
+                    status_text.error(f"❌ 算法 {mon_algo_name} 运行出错: {e}")
+                    st.error(f"**{mon_algo_name}** 运行出错: `{e}`")
+
+            completed_algo_names = list(multi_results.keys())
+            st.session_state.monitor_data = {
+                'algorithms': completed_algo_names,
+                'multi_results': multi_results,
+                'problem': mon_problem.name,
+                'problem_obj': mon_problem,
+                'n_obj': mon_problem.n_obj,
+                'has_true_front': has_true_front,
+                'hv_threshold_pct': mon_hv_threshold,
+                'igd_threshold_pct': mon_igd_threshold,
+            }
+
+            failed_algos = [an for an, res in multi_results.items() if res.get('failed')]
+            if failed_algos:
                 progress_bar.progress(1.0)
-                status_text.success(f"✅ 所有 {len(mon_algo_names)} 个算法监控运行完成！")
-                st.session_state.monitor_running = False
-                st.rerun()
+                status_text.warning(
+                    f"⚠️ 运行完成，但 {len(failed_algos)} 个算法失败: {', '.join(failed_algos)}。"
+                    f"已完成 {len(completed_algo_names) - len(failed_algos)} 个算法的结果已展示。"
+                )
+            else:
+                progress_bar.progress(1.0)
+                status_text.success(f"✅ 所有 {len(completed_algo_names)} 个算法监控运行完成！")
+            st.session_state.monitor_running = False
+            st.rerun()
 
         if stop_monitor and st.session_state.monitor_running:
             st.session_state.monitor_running = False
@@ -2024,8 +2062,23 @@ def convergence_monitoring_tab():
         multi_results = mon_data['multi_results']
         algo_names = mon_data['algorithms']
 
+        failed_algos = [an for an in algo_names if multi_results[an].get('failed')]
+        success_algos = [an for an in algo_names if not multi_results[an].get('failed')]
+
+        if failed_algos:
+            st.subheader("❌ 运行失败算法")
+            for an in failed_algos:
+                res = multi_results[an]
+                with st.expander(f"❌ {an} - 运行失败", expanded=True):
+                    st.error(f"**错误信息**: `{res.get('error_message', '未知错误')}`")
+                    partial_gen_count = len(res['generations'])
+                    if partial_gen_count > 0:
+                        st.info(f"该算法在失败前已采集 {partial_gen_count} 个采样点（第 {res['generations'][0]}~{res['generations'][-1]} 代）")
+                    with st.expander("查看详细错误堆栈"):
+                        st.code(res.get('error_detail', ''), language='traceback')
+
         all_warnings = []
-        for an in algo_names:
+        for an in success_algos:
             res = multi_results[an]
             for w in res.get('hv_warnings', []):
                 all_warnings.append((an, w))
@@ -2040,6 +2093,12 @@ def convergence_monitoring_tab():
                 elif w['type'] == 'igd_rebound':
                     st.error(f"**{algo_n}**: {w['message']}")
 
+        if not success_algos:
+            st.error("❌ 所有算法均运行失败，无可用数据展示")
+            return
+
+        display_algo_names = success_algos
+
         st.subheader("📊 收敛指标对比曲线")
 
         hv_data = {}
@@ -2048,7 +2107,7 @@ def convergence_monitoring_tab():
         hv_stag_points = {}
         igd_reb_points = {}
 
-        for an in algo_names:
+        for an in display_algo_names:
             res = multi_results[an]
             hv_data[an] = res['hv']
             spacing_data[an] = res['spacing']
@@ -2057,7 +2116,7 @@ def convergence_monitoring_tab():
             hv_stag_points[an] = res['hv_stagnation_gens']
             igd_reb_points[an] = res['igd_rebound_gens']
 
-        gens = multi_results[algo_names[0]]['generations']
+        gens = multi_results[display_algo_names[0]]['generations']
 
         fig_hv = plot_convergence_with_warnings(
             hv_data,
@@ -2116,10 +2175,10 @@ def convergence_monitoring_tab():
 
             selected_gen = gens[selected_idx]
 
-            n_algos = len(algo_names)
+            n_algos = len(display_algo_names)
             scatter_cols = st.columns(n_algos)
 
-            for i, an in enumerate(algo_names):
+            for i, an in enumerate(display_algo_names):
                 res = multi_results[an]
                 with scatter_cols[i]:
                     st.markdown(f"**{an}**")
@@ -2156,15 +2215,25 @@ def convergence_monitoring_tab():
         speed_rows = []
         for an in algo_names:
             res = multi_results[an]
-            stable_gen = res.get('hv_stable_generation')
-            speed_rows.append({
-                '算法名': an,
-                '达到HV稳定的代数': stable_gen if stable_gen is not None else '未收敛',
-                '最终HV值': res.get('final_hv', np.nan),
-                '最终IGD值': res.get('final_igd', np.nan),
-                '最终Spacing值': res.get('final_spacing', np.nan),
-                '总耗时(秒)': round(res.get('runtime', 0.0), 3),
-            })
+            if res.get('failed'):
+                speed_rows.append({
+                    '算法名': an,
+                    '达到HV稳定的代数': '运行失败',
+                    '最终HV值': np.nan,
+                    '最终IGD值': np.nan,
+                    '最终Spacing值': np.nan,
+                    '总耗时(秒)': round(res.get('runtime', 0.0), 3),
+                })
+            else:
+                stable_gen = res.get('hv_stable_generation')
+                speed_rows.append({
+                    '算法名': an,
+                    '达到HV稳定的代数': stable_gen if stable_gen is not None else '未收敛',
+                    '最终HV值': res.get('final_hv', np.nan),
+                    '最终IGD值': res.get('final_igd', np.nan),
+                    '最终Spacing值': res.get('final_spacing', np.nan),
+                    '总耗时(秒)': round(res.get('runtime', 0.0), 3),
+                })
 
         df_speed = pd.DataFrame(speed_rows)
 
@@ -2186,7 +2255,18 @@ def convergence_monitoring_tab():
 
         for an in algo_names:
             res = multi_results[an]
-            with st.expander(f"📊 {an} - 详细数据"):
+            if res.get('failed'):
+                tag = "❌"
+            else:
+                tag = "📊"
+            with st.expander(f"{tag} {an} - 详细数据"):
+                if res.get('failed'):
+                    st.error(f"该算法运行失败: `{res.get('error_message', '未知错误')}`")
+                    if len(res['generations']) > 0:
+                        st.info(f"失败前已采集 {len(res['generations'])} 个采样点，以下为部分数据")
+                    else:
+                        continue
+
                 df_data = {
                     '代数': res['generations'],
                     'HV': res['hv'],

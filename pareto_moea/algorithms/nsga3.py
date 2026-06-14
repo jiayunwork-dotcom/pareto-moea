@@ -178,12 +178,12 @@ class NSGA3(Algorithm):
         n_remaining = n_select - current_size
 
         chosen = self._niching_selection(
-            objectives, np.array(selected), last_front, n_remaining
+            objectives, np.array(selected, dtype=int), last_front, n_remaining
         )
 
         selected.extend(chosen.tolist())
 
-        return np.array(selected)
+        return np.array(selected, dtype=int)
 
     def _niching_selection(self, objectives: np.ndarray,
                            selected_indices: np.ndarray,
@@ -203,7 +203,7 @@ class NSGA3(Algorithm):
             从最后一个前沿层选中的个体索引
         """
         n_obj = self.problem.n_obj
-        all_indices = np.concatenate([selected_indices, last_front])
+        all_indices = np.concatenate([selected_indices, last_front]).astype(int)
         all_objectives = objectives[all_indices]
 
         ideal_point = np.min(all_objectives, axis=0)
